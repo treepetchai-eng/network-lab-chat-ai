@@ -1,0 +1,319 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-ui), var(--font-thai), system-ui, sans-serif;
+  --font-mono: var(--font-code), monospace;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+  --background: oklch(0.11 0.018 250);
+  --foreground: oklch(0.96 0.01 255);
+  --card: oklch(0.16 0.018 252);
+  --card-foreground: oklch(0.96 0.01 255);
+  --popover: oklch(0.16 0.018 252);
+  --popover-foreground: oklch(0.96 0.01 255);
+  --primary: oklch(0.78 0.11 215);
+  --primary-foreground: oklch(0.12 0.018 252);
+  --secondary: oklch(0.26 0.025 252);
+  --secondary-foreground: oklch(0.96 0.01 255);
+  --muted: oklch(0.18 0.012 252);
+  --muted-foreground: oklch(0.66 0.02 250);
+  --accent: oklch(0.2 0.02 252);
+  --accent-foreground: oklch(0.96 0.01 255);
+  --destructive: oklch(0.65 0.2 22);
+  --border: oklch(0.28 0.015 252);
+  --input: oklch(0.24 0.015 252);
+  --ring: oklch(0.78 0.11 215);
+  --chart-1: oklch(0.77 0.11 215);
+  --chart-2: oklch(0.72 0.08 190);
+  --chart-3: oklch(0.62 0.07 260);
+  --chart-4: oklch(0.72 0.07 150);
+  --chart-5: oklch(0.8 0.06 100);
+  --radius: 0.95rem;
+  --sidebar: oklch(0.14 0.018 252);
+  --sidebar-foreground: oklch(0.96 0.01 255);
+  --sidebar-primary: oklch(0.78 0.11 215);
+  --sidebar-primary-foreground: oklch(0.96 0.01 255);
+  --sidebar-accent: oklch(0.18 0.018 252);
+  --sidebar-accent-foreground: oklch(0.96 0.01 255);
+  --sidebar-border: oklch(0.25 0.015 252);
+  --sidebar-ring: oklch(0.78 0.11 215);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  html {
+    @apply font-sans scroll-smooth;
+    font-size: 15.5px;
+  }
+
+  body {
+    @apply min-h-dvh overflow-x-hidden bg-background text-foreground;
+    font-feature-settings: "ss01" 1, "cv02" 1, "cv03" 1;
+    text-rendering: optimizeLegibility;
+    background-image:
+      radial-gradient(circle at top, rgba(34, 211, 238, 0.1), transparent 30%),
+      radial-gradient(circle at 84% 10%, rgba(59, 130, 246, 0.1), transparent 24%),
+      linear-gradient(180deg, #040812 0%, #07111d 45%, #04070d 100%);
+  }
+
+  ::selection {
+    background: rgba(103, 232, 249, 0.18);
+    color: white;
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: rgba(148, 163, 184, 0.22);
+    border-radius: 999px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(125, 211, 252, 0.34);
+  }
+
+  .scrollbar-none {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+
+  .chat-scroll {
+    scrollbar-gutter: stable;
+  }
+
+  .chat-scroll::-webkit-scrollbar {
+    width: 10px;
+  }
+
+  .chat-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .chat-scroll::-webkit-scrollbar-thumb {
+    background: rgba(148, 163, 184, 0.22);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+
+  .chat-scroll::-webkit-scrollbar-thumb:hover {
+    background: rgba(125, 211, 252, 0.34);
+    background-clip: padding-box;
+  }
+}
+
+@keyframes shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@keyframes drift {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0);
+  }
+  50% {
+    transform: translate3d(0, -8px, 0);
+  }
+}
+
+@keyframes gentle-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+@keyframes panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes beacon-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes beacon-breathe {
+  0%,
+  100% {
+    opacity: 0.4;
+    transform: scale(0.94);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.02);
+  }
+}
+
+@keyframes stream-caret {
+  0%,
+  45% {
+    opacity: 0;
+  }
+  55%,
+  100% {
+    opacity: 1;
+  }
+}
+
+@keyframes thinking-dot {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+    transform: scale(0.85);
+  }
+  40% {
+    opacity: 1;
+    transform: scale(1.2);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@layer utilities {
+  .animate-panel-in {
+    animation: panel-in 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  .animate-drift {
+    animation: drift 5.5s ease-in-out infinite;
+  }
+
+  .animate-gentle-pulse {
+    animation: gentle-pulse 2.8s ease-in-out infinite;
+  }
+
+  .animate-beacon-spin {
+    animation: beacon-spin 3s linear infinite;
+  }
+
+  .animate-beacon-breathe {
+    animation: beacon-breathe 1.8s ease-in-out infinite;
+  }
+
+  .animate-stream-caret {
+    animation: stream-caret 1s steps(1, end) infinite;
+  }
+
+  .animate-thinking-dot {
+    animation: thinking-dot 1.4s ease-in-out infinite;
+  }
+
+  .animate-fade-in {
+    animation: fade-in 0.4s ease-out both;
+  }
+
+  .animate-fade-in-up {
+    animation: fade-in-up 0.45s cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  .glass-panel {
+    @apply border border-white/10 bg-white/[0.04] shadow-[0_30px_90px_rgba(2,7,18,0.46)] backdrop-blur-2xl;
+  }
+
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .ui-copy {
+    @apply text-[0.88rem] leading-6 tracking-[0.002em] sm:text-[0.98rem] sm:leading-7;
+  }
+
+  .ui-copy-tight {
+    @apply text-[0.84rem] leading-5 sm:text-[0.93rem] sm:leading-6;
+  }
+}
