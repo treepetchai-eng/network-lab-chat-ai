@@ -5,7 +5,6 @@ import { motion } from "framer-motion";
 import { Plus } from "lucide-react";
 import { useState } from "react";
 import { ConfirmDialog } from "@/components/layout/confirm-dialog";
-import { GlobalNav } from "@/components/layout/global-nav";
 
 interface TopHeaderProps {
   onNewChat: () => void;
@@ -48,7 +47,7 @@ export function TopHeader({ onNewChat, hasMessages }: TopHeaderProps) {
                     <span className="text-[0.58rem] font-medium uppercase tracking-[0.12em] text-emerald-300/80">Online</span>
                   </div>
                 </div>
-                <p className="hidden text-[0.72rem] text-slate-500 sm:block">AI-powered network operations assistant</p>
+                <p className="hidden text-[0.72rem] text-slate-500 sm:block">AI-powered network chat assistant</p>
               </div>
             </div>
             <button
@@ -59,7 +58,6 @@ export function TopHeader({ onNewChat, hasMessages }: TopHeaderProps) {
               <span className="hidden xs:inline">New Chat</span>
             </button>
           </div>
-          <GlobalNav className="mt-3" tone="chat" />
         </div>
       </motion.header>
       <ConfirmDialog

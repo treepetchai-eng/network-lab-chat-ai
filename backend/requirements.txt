@@ -23,9 +23,6 @@ ntc-templates>=6.0.0
 
 # Environment & Configuration
 python-dotenv>=1.0.1
-sqlalchemy>=2.0.36
-psycopg[binary]>=3.2.3
-alembic>=1.14.1
 
 # HTTP Client (used in tests and health checks)
 requests>=2.32.3

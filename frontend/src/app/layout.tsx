@@ -22,7 +22,7 @@ const thaiFont = Noto_Sans_Thai({
 
 export const metadata: Metadata = {
   title: "Network Copilot",
-  description: "AI-powered network operations assistant for device monitoring and troubleshooting",
+  description: "AI-powered network chat assistant for troubleshooting conversations",
   icons: { icon: "/logo.svg" },
 };
 
