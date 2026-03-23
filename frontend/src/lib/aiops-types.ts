@@ -73,6 +73,7 @@ export interface AIOpsProposal {
   status: string;
   approved_at?: string | null;
   approved_by?: string | null;
+  cancelled_reason?: string | null;
   created_at: string;
   incident_no?: string;
   incident_title?: string;

@@ -624,11 +624,26 @@ def free_run_node(
 ) -> dict:
     device_cache: dict = state.get("device_cache", {})
     messages: list[BaseMessage] = list(state["messages"])
+    incident_context: str = state.get("incident_context", "") or ""
     user_query = _find_user_query(messages)
 
     cache_section = _build_cache_section(device_cache)
     # Compact prompt for tool-calling iterations (fewer tokens → faster inference)
     compact_prompt = SSH_COMPACT_PROMPT.format(device_cache_section=cache_section)
+    # For incident-scoped sessions, prepend incident context so the LLM knows
+    # exactly which device/incident it is assisting with, without scanning all devices.
+    if incident_context:
+        compact_prompt = (
+            f"=== ACTIVE INCIDENT CONTEXT ===\n"
+            f"{incident_context}\n"
+            f"================================\n\n"
+            f"You are assisting a network engineer who is investigating the incident above. "
+            f"Focus your investigation on the affected device and interface listed in the context. "
+            f"You can run additional CLI commands to gather more information. "
+            f"The automated AIOps pipeline may also be running commands on the same device — "
+            f"your commands will queue safely behind any in-flight pipeline work.\n\n"
+            + compact_prompt
+        )
     compact_system_msg = SystemMessage(content=compact_prompt)
     # Synthesis prompt is built lazily only when tools were executed (see below)
 

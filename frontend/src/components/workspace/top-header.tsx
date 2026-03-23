@@ -2,81 +2,103 @@
 
 import Image from "next/image";
 import Link from "next/link";
-import { motion } from "framer-motion";
-import { LayoutDashboard, Plus } from "lucide-react";
-import { useState } from "react";
+import { LayoutDashboard, Plus, Activity, ClipboardList, Wifi } from "lucide-react";
+import { useState, useEffect } from "react";
 import { ConfirmDialog } from "@/components/layout/confirm-dialog";
+import { fetchDashboard } from "@/lib/aiops-api";
 
 interface TopHeaderProps {
   onNewChat: () => void;
   hasMessages: boolean;
 }
 
+function useLiveCounts() {
+  const [counts, setCounts] = useState({ active_incidents: 0, pending_approvals: 0 });
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const d = await fetchDashboard();
+        setCounts({
+          active_incidents:  d.metrics?.active_incidents  ?? 0,
+          pending_approvals: d.metrics?.pending_approvals ?? 0,
+        });
+      } catch { /* ignore */ }
+    };
+    load();
+    const id = setInterval(load, 30_000);
+    return () => clearInterval(id);
+  }, []);
+  return counts;
+}
+
 export function TopHeader({ onNewChat, hasMessages }: TopHeaderProps) {
   const [showConfirm, setShowConfirm] = useState(false);
+  const counts = useLiveCounts();
 
   const handleNewChat = () => {
-    if (hasMessages) {
-      setShowConfirm(true);
-      return;
-    }
+    if (hasMessages) { setShowConfirm(true); return; }
     onNewChat();
   };
 
   return (
     <>
-      <motion.header
-        initial={{ opacity: 0, y: -8 }}
-        animate={{ opacity: 1, y: 0 }}
-        className="sticky top-0 z-20 border-b border-white/8 bg-[linear-gradient(180deg,rgba(6,11,20,0.92),rgba(6,11,20,0.72))] backdrop-blur-2xl"
-      >
-        <div className="mx-auto w-full max-w-[92rem] px-3 py-2.5 sm:px-4 sm:py-3 md:px-6">
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex items-center gap-2.5 sm:gap-3">
-              <div className="relative flex h-9 w-9 items-center justify-center rounded-xl border border-cyan-300/16 bg-white/[0.04] shadow-[0_0_32px_rgba(34,211,238,0.14)] backdrop-blur-xl sm:h-10 sm:w-10 sm:rounded-2xl">
-                <div className="absolute inset-1 rounded-[10px] bg-[radial-gradient(circle_at_30%_30%,rgba(103,232,249,0.18),transparent_62%)] sm:rounded-[14px]" />
-                <Image src="/logo.svg" alt="Network Copilot" width={20} height={20} className="relative z-10 sm:h-[22px] sm:w-[22px]" />
-              </div>
-              <div>
-                <div className="flex items-center gap-2">
-                  <h1 className="text-[0.9rem] font-semibold tracking-[0.01em] text-white sm:text-[1rem]">Network Copilot</h1>
-                  <div className="flex items-center gap-1.5 rounded-full border border-emerald-300/16 bg-emerald-400/8 px-2 py-0.5">
-                    <span className="relative flex h-1.5 w-1.5">
-                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-50" />
-                      <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-400" />
-                    </span>
-                    <span className="text-[0.58rem] font-medium uppercase tracking-[0.12em] text-emerald-300/80">Online</span>
-                  </div>
-                </div>
-                <p className="hidden text-[0.72rem] text-slate-500 sm:block">AI-powered network chat assistant</p>
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <Link
-                href="/aiops"
-                className="group inline-flex items-center gap-1.5 rounded-xl border border-cyan-300/16 bg-cyan-400/[0.07] px-2.5 py-1.5 text-xs text-cyan-100 transition-all duration-300 hover:border-cyan-300/28 hover:bg-cyan-400/[0.12] hover:text-white hover:shadow-[0_0_22px_rgba(34,211,238,0.12)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/30 active:scale-[0.97] sm:gap-2 sm:rounded-2xl sm:px-3.5 sm:py-2 sm:text-sm"
-              >
-                <LayoutDashboard className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
-                <span className="hidden xs:inline">AIOps Console</span>
-              </Link>
-              <button
-                onClick={handleNewChat}
-                className="group inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-xs text-slate-300 transition-all duration-300 hover:border-cyan-300/22 hover:bg-cyan-400/[0.07] hover:text-white hover:shadow-[0_0_20px_rgba(34,211,238,0.08)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/30 active:scale-[0.97] sm:gap-2 sm:rounded-2xl sm:px-3.5 sm:py-2 sm:text-sm"
-              >
-                <Plus className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
-                <span className="hidden xs:inline">New Chat</span>
-              </button>
-            </div>
+      <header className="sticky top-0 z-20 flex h-12 items-center gap-4 border-b border-white/[0.07] bg-[#080d16]/95 px-4 backdrop-blur-sm sm:px-6">
+        {/* Brand */}
+        <div className="flex items-center gap-2.5">
+          <div className="flex h-6 w-6 items-center justify-center rounded bg-cyan-500/15 ring-1 ring-cyan-500/30">
+            <Wifi className="h-3.5 w-3.5 text-cyan-400" />
           </div>
+          <span className="text-[0.8rem] font-semibold tracking-tight text-white">Network Copilot</span>
+          <span className="hidden text-white/20 sm:block">·</span>
+          <span className="hidden text-[0.75rem] text-slate-500 sm:block">AI Chat Assistant</span>
         </div>
-      </motion.header>
+
+        {/* Right side */}
+        <div className="flex flex-1 items-center justify-end gap-2">
+          {/* Live incident pills */}
+          {counts.active_incidents > 0 && (
+            <Link
+              href="/aiops/incidents"
+              className="hidden items-center gap-1.5 rounded border border-rose-500/20 bg-rose-500/[0.07] px-2.5 py-0.5 text-[0.7rem] font-medium text-rose-300 transition hover:bg-rose-500/[0.12] sm:flex"
+            >
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-rose-400" />
+              {counts.active_incidents} active incident{counts.active_incidents !== 1 ? "s" : ""}
+            </Link>
+          )}
+          {counts.pending_approvals > 0 && (
+            <Link
+              href="/aiops/approvals"
+              className="hidden items-center gap-1.5 rounded border border-fuchsia-500/20 bg-fuchsia-500/[0.07] px-2.5 py-0.5 text-[0.7rem] font-medium text-fuchsia-300 transition hover:bg-fuchsia-500/[0.12] sm:flex"
+            >
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-fuchsia-400" />
+              {counts.pending_approvals} awaiting approval
+            </Link>
+          )}
+
+          {/* New chat */}
+          <button
+            onClick={handleNewChat}
+            className="inline-flex items-center gap-1.5 rounded border border-white/8 bg-white/[0.04] px-2.5 py-1 text-[0.75rem] text-slate-400 transition hover:border-white/14 hover:text-slate-200"
+          >
+            <Plus className="h-3 w-3" />
+            <span className="hidden sm:inline">New Chat</span>
+          </button>
+
+          {/* AIOps Console link */}
+          <Link
+            href="/aiops"
+            className="inline-flex items-center gap-1.5 rounded border border-cyan-500/20 bg-cyan-500/[0.07] px-2.5 py-1 text-[0.75rem] text-cyan-300 transition hover:bg-cyan-500/[0.12] hover:text-cyan-100"
+          >
+            <LayoutDashboard className="h-3 w-3" />
+            <span className="hidden sm:inline">AIOps Console</span>
+          </Link>
+        </div>
+      </header>
+
       <ConfirmDialog
         open={showConfirm}
         onOpenChange={setShowConfirm}
-        onConfirm={() => {
-          setShowConfirm(false);
-          onNewChat();
-        }}
+        onConfirm={() => { setShowConfirm(false); onNewChat(); }}
       />
     </>
   );

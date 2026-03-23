@@ -43,6 +43,17 @@ export async function createSession(): Promise<string> {
   return data.session_id;
 }
 
+export async function createIncidentSession(incidentNo: string): Promise<string> {
+  const res = await fetchWithTimeout(
+    `${API_BASE_URL}/api/session/incident/${encodeURIComponent(incidentNo)}`,
+    { method: "POST" },
+    CHAT_START_TIMEOUT_MS,
+  );
+  if (!res.ok) throw new Error("Failed to create incident session");
+  const data = await res.json();
+  return data.session_id;
+}
+
 interface DeleteSessionOptions {
   keepalive?: boolean;
 }

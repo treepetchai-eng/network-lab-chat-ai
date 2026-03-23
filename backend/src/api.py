@@ -180,6 +180,85 @@ async def create_session_endpoint():
     return CreateSessionResponse(session_id=session.session_id)
 
 
+def _build_incident_context(detail: dict) -> str:
+    """Build a concise context string from incident detail to inject into the LLM system prompt."""
+    inc = detail.get("incident", {})
+    ts = detail.get("troubleshoot")
+    ai_sum = detail.get("ai_summary")
+    logs = detail.get("raw_logs", [])
+
+    lines: list[str] = [
+        f"Incident:   {inc.get('incident_no', '?')} — {inc.get('severity', '?').upper()} / {inc.get('status', '?')}",
+        f"Title:      {inc.get('title', '?')}",
+        f"Device:     {inc.get('primary_hostname') or inc.get('primary_source_ip', '?')} "
+        f"({inc.get('primary_source_ip', '')}, {inc.get('os_platform', '')}, {inc.get('device_role', '')})",
+        f"Family:     {inc.get('event_family', '?')}",
+        f"Corr. key:  {inc.get('correlation_key', '?')}",
+    ]
+
+    if ai_sum:
+        summary_text = (ai_sum.get("summary") or "")[:400]
+        if summary_text:
+            lines.append(f"\nAI Summary:\n{summary_text}")
+
+    if ts:
+        steps = ts.get("steps") or []
+        cli_steps = [s for s in steps if s.get("tool_name") == "run_cli"]
+        if cli_steps:
+            lines.append("\nCLI Evidence Already Gathered:")
+            for i, step in enumerate(cli_steps[:4], 1):
+                cmd = (step.get("args") or {}).get("command", "?")
+                output = (step.get("content") or "").strip()[:600]
+                lines.append(f"  [{i}] {cmd}")
+                if output:
+                    lines.append(f"      {output[:300]}")
+
+    if logs:
+        lines.append("\nRecent Syslog (latest first):")
+        for log in logs[:6]:
+            lines.append(f"  {log.get('raw_message', '')[:140]}")
+
+    return "\n".join(lines)
+
+
+@app.post("/api/session/incident/{incident_no}", response_model=CreateSessionResponse)
+async def create_incident_session_endpoint(incident_no: str):
+    """Create a chat session pre-loaded with incident context and device cache.
+
+    The LLM will know which incident/device it is assisting with from the first
+    message, avoiding a lookup_device round-trip and improving response quality.
+    """
+    _ensure_aiops_ready()
+    try:
+        detail = _aiops_service.get_incident(incident_no)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    incident_context = _build_incident_context(detail)
+
+    # Pre-populate device_cache with the primary device so the LLM can SSH
+    # immediately without calling lookup_device first.
+    device_cache_prefill: dict = {}
+    inc = detail.get("incident", {})
+    hostname = inc.get("primary_hostname") or ""
+    ip = inc.get("primary_source_ip") or ""
+    if hostname and ip:
+        device_cache_prefill[hostname] = {
+            "ip_address": ip,
+            "os_platform": inc.get("os_platform") or "cisco_ios",
+            "device_role": inc.get("device_role") or "",
+            "site": inc.get("site") or "",
+            "version": inc.get("version") or "",
+            "tunnel_ips": [],
+        }
+
+    session = await create_session(
+        incident_context=incident_context,
+        device_cache_prefill=device_cache_prefill,
+    )
+    return CreateSessionResponse(session_id=session.session_id)
+
+
 @app.delete("/api/session/{session_id}")
 async def delete_session_endpoint(session_id: str):
     removed = await delete_session(session_id)

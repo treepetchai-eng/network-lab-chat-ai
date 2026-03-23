@@ -22,6 +22,7 @@ class SessionData:
     thread_id: str
     device_cache: dict
     graph: object  # CompiledStateGraph
+    incident_context: str = ""  # Non-empty for incident-scoped chat sessions
     progress_sink: dict = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_active: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -39,11 +40,22 @@ _sessions: dict[str, SessionData] = {}
 _lock = asyncio.Lock()
 
 
-async def create_session() -> SessionData:
-    """Create a new session with a fresh graph and empty grounded cache."""
+async def create_session(
+    *,
+    incident_context: str = "",
+    device_cache_prefill: dict | None = None,
+) -> SessionData:
+    """Create a new session with a fresh graph and empty grounded cache.
+
+    Args:
+        incident_context: Pre-formatted incident context string injected into
+            the LLM system prompt for incident-scoped chat sessions.
+        device_cache_prefill: Optional device entries to pre-populate the cache
+            so the LLM doesn't need to call lookup_device for known devices.
+    """
     session_id = str(uuid.uuid4())
     thread_id = str(uuid.uuid4())
-    device_cache: dict = {}
+    device_cache: dict = dict(device_cache_prefill or {})
     progress_sink: dict = {}
     graph = build_graph(device_cache, progress_sink)
 
@@ -52,6 +64,7 @@ async def create_session() -> SessionData:
         thread_id=thread_id,
         device_cache=device_cache,
         graph=graph,
+        incident_context=incident_context,
         progress_sink=progress_sink,
     )
 

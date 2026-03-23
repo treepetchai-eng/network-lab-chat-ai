@@ -99,6 +99,7 @@ async def stream_chat(
     inputs = {
         "messages": [HumanMessage(content=user_message)],
         "device_cache": session.device_cache,
+        "incident_context": session.incident_context,
     }
 
     last_command = ""

@@ -26,6 +26,7 @@ const LABELS: Record<string, string> = {
   rejected:          "Rejected",
   completed:         "Completed",
   failed:            "Failed",
+  cancelled:         "Cancelled",
   // Disposition
   needs_human_review: "Human Review",
   self_recovered:     "Self Recovered",
@@ -76,6 +77,7 @@ const STYLES: Record<string, string> = {
   rejected:          "border-red-500/30    bg-red-500/10    text-red-300",
   completed:         "border-emerald-500/30 bg-emerald-500/10 text-emerald-300",
   failed:            "border-rose-500/30   bg-rose-500/10   text-rose-300",
+  cancelled:         "border-slate-700/40  bg-slate-700/20  text-slate-500",
 
   // Disposition
   needs_human_review: "border-amber-500/30 bg-amber-500/10 text-amber-300",

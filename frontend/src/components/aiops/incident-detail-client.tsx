@@ -4,8 +4,8 @@ import Link from "next/link";
 import { useState, useTransition, useEffect, useCallback } from "react";
 import {
   Activity, AlertTriangle, CheckCircle2, ChevronDown, ChevronRight,
-  ChevronUp, Clock, Copy, Eye, FileSearch, Loader2, Play, RotateCcw,
-  Server, ShieldAlert, Terminal, Wifi, Wrench, XCircle, Zap,
+  ChevronUp, Clock, Copy, Eye, FileSearch, Loader2, MessageSquare,
+  Play, RotateCcw, Server, ShieldAlert, Terminal, Wifi, Wrench, XCircle, Zap,
 } from "lucide-react";
 import type { AIOpsIncidentDetailPayload, AIOpsTimelineEntry } from "@/lib/aiops-types";
 import {
@@ -13,6 +13,7 @@ import {
   runTroubleshoot, submitRecoveryDecision,
 } from "@/lib/aiops-api";
 import { StatusBadge } from "@/components/aiops/status-badge";
+import { IncidentChat } from "@/components/aiops/incident-chat";
 
 const POLL_INTERVAL = 15_000;
 
@@ -706,11 +707,14 @@ const SEV_BORDER: Record<string, string> = {
   info:     "border-l-sky-500/60",
 };
 
+type Tab = "overview" | "chat";
+
 export function IncidentDetailClient({ initialData }: { initialData: AIOpsIncidentDetailPayload }) {
   const [data, setData]             = useState(initialData);
   const [pending, startTransition]  = useTransition();
   const [error, setError]           = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [activeTab, setActiveTab]   = useState<Tab>("overview");
 
   const incident = data.incident;
 
@@ -824,25 +828,53 @@ export function IncidentDetailClient({ initialData }: { initialData: AIOpsIncide
         )}
       </div>
 
-      {/* ── Two-column body ── */}
-      <div className="grid gap-5 xl:grid-cols-[1fr_300px]">
+      {/* ── Tab bar ── */}
+      <div className="flex gap-1 border-b border-white/[0.06]">
+        {([
+          { id: "overview" as Tab, label: "Overview", icon: Server },
+          { id: "chat"     as Tab, label: "Chat",     icon: MessageSquare },
+        ] as { id: Tab; label: string; icon: React.ElementType }[]).map(({ id, label, icon: Icon }) => (
+          <button
+            key={id}
+            onClick={() => setActiveTab(id)}
+            className={`flex items-center gap-1.5 px-4 py-2.5 text-[0.78rem] font-medium transition border-b-2 -mb-px ${
+              activeTab === id
+                ? "border-cyan-500 text-cyan-300"
+                : "border-transparent text-slate-500 hover:text-slate-300"
+            }`}
+          >
+            <Icon className="h-3.5 w-3.5" />
+            {label}
+          </button>
+        ))}
+      </div>
 
-        {/* Main scroll column */}
-        <div className="space-y-4 min-w-0">
-          <div id="what-to-do"><WhatToDoNext data={data} /></div>
-          <InvestigationSection data={data} loading={actionLoading === "troubleshoot"} />
-          <RemediationPlan data={data} withAction={withAction} actionLoading={actionLoading} />
-          <SyslogSection data={data} />
-          <TimelineSection entries={data.timeline} />
-        </div>
-
-        {/* Sticky sidebar */}
-        <div className="hidden xl:block">
-          <div className="sticky top-16">
-            <Sidebar data={data} />
+      {/* ── Overview tab ── */}
+      {activeTab === "overview" && (
+        <div className="grid gap-5 xl:grid-cols-[1fr_300px]">
+          {/* Main scroll column */}
+          <div className="space-y-4 min-w-0">
+            <div id="what-to-do"><WhatToDoNext data={data} /></div>
+            <InvestigationSection data={data} loading={actionLoading === "troubleshoot"} />
+            <RemediationPlan data={data} withAction={withAction} actionLoading={actionLoading} />
+            <SyslogSection data={data} />
+            <TimelineSection entries={data.timeline} />
+          </div>
+          {/* Sticky sidebar */}
+          <div className="hidden xl:block">
+            <div className="sticky top-16">
+              <Sidebar data={data} />
+            </div>
           </div>
         </div>
-      </div>
+      )}
+
+      {/* ── Chat tab ── */}
+      {activeTab === "chat" && (
+        <div>
+          <IncidentChat data={data} />
+        </div>
+      )}
     </div>
   );
 }

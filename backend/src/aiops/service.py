@@ -311,6 +311,7 @@ class AIOpsService:
                     ("candidate_groups", "decision_locked_at",          "TIMESTAMPTZ"),
                     ("candidate_groups", "last_decision_event_count",   "INTEGER NOT NULL DEFAULT 0"),
                     ("proposals",        "rollback_commands",           "JSONB NOT NULL DEFAULT '[]'::jsonb"),
+                    ("proposals",        "cancelled_reason",            "TEXT"),
                 ]
                 cur.execute(
                     """
@@ -523,6 +524,19 @@ class AIOpsService:
                     (stability_secs,),
                 )
                 resolved = cur.fetchall()
+                if resolved:
+                    resolved_ids = [row["id"] for row in resolved]
+                    # Cancel any pending/approved proposals whose incident just resolved
+                    cur.execute(
+                        """
+                        UPDATE proposals
+                        SET status = 'cancelled',
+                            cancelled_reason = 'incident_auto_resolved'
+                        WHERE incident_id = ANY(%s)
+                          AND status IN ('pending', 'approved')
+                        """,
+                        (resolved_ids,),
+                    )
                 for row in resolved:
                     self._record_timeline(
                         cur,
@@ -1709,7 +1723,7 @@ class AIOpsService:
             "metrics": {
                 "active_incidents": len(incidents),
                 "recovering_incidents": recovering,
-                "pending_approvals": len(approvals),
+                "pending_approvals": sum(1 for p in approvals if p["status"] in ("pending", "approved")),
                 "resolved_today": resolved_today,
                 "reopened_this_week": reopened,
             },

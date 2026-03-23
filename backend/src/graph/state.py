@@ -14,3 +14,4 @@ class AgentState(TypedDict):
 
     messages: Annotated[Sequence[BaseMessage], operator.add]
     device_cache: dict
+    incident_context: str  # Empty string for regular chat; non-empty for incident-scoped sessions

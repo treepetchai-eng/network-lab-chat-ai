@@ -2,7 +2,6 @@
 
 import { AnimatePresence, motion } from "framer-motion";
 import type { ReactNode } from "react";
-import { BackgroundAtmosphere } from "@/components/workspace/background-atmosphere";
 
 interface AppShellProps {
   header: ReactNode;
@@ -12,8 +11,11 @@ interface AppShellProps {
 
 export function AppShell({ header, children, error }: AppShellProps) {
   return (
-    <div className="relative h-dvh overflow-hidden bg-[#04070d] text-white">
-      <BackgroundAtmosphere />
+    <div className="relative h-dvh overflow-hidden bg-[#080d16] text-white">
+      <div className="pointer-events-none absolute inset-0 overflow-hidden" aria-hidden="true">
+        <div className="absolute -left-24 top-0 h-[28rem] w-[28rem] rounded-full bg-cyan-400/[0.06] blur-[160px]" />
+        <div className="absolute right-0 top-20 h-[24rem] w-[24rem] rounded-full bg-blue-500/[0.05] blur-[160px]" />
+      </div>
       <div className="relative z-10 flex h-dvh flex-col overflow-hidden">
         {header}
         <main className="flex-1 min-h-0 overflow-hidden">

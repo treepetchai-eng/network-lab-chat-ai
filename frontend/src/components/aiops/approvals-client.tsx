@@ -16,6 +16,7 @@ import {
   Loader2,
   Server,
   Eye,
+  Ban,
 } from "lucide-react";
 import { SectionCard } from "@/components/aiops/section-card";
 import { StatusBadge } from "@/components/aiops/status-badge";
@@ -172,10 +173,11 @@ export function ProposalCard({
     }
   }
 
-  const isPending  = proposal.status === "pending";
-  const isApproved = proposal.status === "approved";
-  const isDone     = proposal.status === "executed" || !!execution;
-  const isBusy     = actionState !== "idle";
+  const isPending   = proposal.status === "pending";
+  const isApproved  = proposal.status === "approved";
+  const isCancelled = proposal.status === "cancelled";
+  const isDone      = proposal.status === "executed" || !!execution;
+  const isBusy      = actionState !== "idle";
 
   return (
     <div className="border-b border-white/[0.05] last:border-0">
@@ -184,7 +186,11 @@ export function ProposalCard({
         onClick={() => setExpanded((v) => !v)}
         className="flex w-full items-start gap-3 px-5 py-4 text-left transition hover:bg-white/[0.02]"
       >
-        <ShieldAlert className={`mt-0.5 h-4 w-4 shrink-0 ${isDone ? "text-slate-600" : "text-fuchsia-400"}`} />
+        {isCancelled ? (
+          <Ban className="mt-0.5 h-4 w-4 shrink-0 text-slate-600" />
+        ) : (
+          <ShieldAlert className={`mt-0.5 h-4 w-4 shrink-0 ${isDone ? "text-slate-600" : "text-fuchsia-400"}`} />
+        )}
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-[0.66rem] font-semibold uppercase tracking-widest text-slate-600">
@@ -226,6 +232,11 @@ export function ProposalCard({
         <div className="border-t border-white/[0.05] bg-white/[0.015] px-5 pb-5 pt-4">
           <div className="space-y-4">
 
+            {/* Full rationale */}
+            {proposal.rationale && (
+              <p className="text-[0.78rem] leading-relaxed text-slate-400">{proposal.rationale}</p>
+            )}
+
             {/* Target devices */}
             {proposal.target_devices?.length ? (
               <div>
@@ -265,6 +276,22 @@ export function ProposalCard({
               </div>
             )}
 
+            {/* Cancelled notice */}
+            {isCancelled && (
+              <p className="flex items-center gap-2 rounded border border-slate-700/50 bg-slate-800/40 px-3 py-2.5 text-[0.78rem] text-slate-500">
+                <Ban className="h-3.5 w-3.5 shrink-0 text-slate-600" />
+                {proposal.cancelled_reason === "incident_auto_resolved"
+                  ? "Proposal superseded — incident was auto-resolved before execution."
+                  : "This proposal was cancelled."}
+                <Link
+                  href={`/aiops/incidents/${incidentNo}`}
+                  className="ml-1 text-slate-400 underline-offset-2 hover:underline"
+                >
+                  View incident →
+                </Link>
+              </p>
+            )}
+
             {/* Execution result */}
             {execution && <ExecutionResult execution={execution} />}
 
@@ -277,7 +304,7 @@ export function ProposalCard({
             )}
 
             {/* Action buttons */}
-            {!isDone && (
+            {!isDone && !isCancelled && (
               <div className="flex items-center gap-3 pt-1">
                 {isPending && (
                   <button
@@ -364,10 +391,21 @@ export function ProposalCard({
   );
 }
 
+type FilterStatus = "all" | "pending" | "approved" | "executed" | "cancelled";
+
+const FILTER_OPTIONS: { value: FilterStatus; label: string }[] = [
+  { value: "all",       label: "All" },
+  { value: "pending",   label: "Pending" },
+  { value: "approved",  label: "Approved" },
+  { value: "executed",  label: "Executed" },
+  { value: "cancelled", label: "Cancelled" },
+];
+
 /* ── Main approvals client ────────────────────────────────────────────── */
 export function ApprovalsClient({ initialApprovals }: { initialApprovals: AIOpsProposal[] }) {
   const [approvals, setApprovals] = useState(initialApprovals);
   const [refreshing, setRefreshing] = useState(false);
+  const [filter, setFilter] = useState<FilterStatus>("all");
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -391,11 +429,23 @@ export function ApprovalsClient({ initialApprovals }: { initialApprovals: AIOpsP
     );
   }
 
-  const pending  = approvals.filter((p) => p.status === "pending");
-  const approved = approvals.filter((p) => p.status === "approved");
-  const others   = approvals.filter((p) => p.status !== "pending" && p.status !== "approved");
+  // Count per status for filter badges
+  const counts = {
+    pending:   approvals.filter((p) => p.status === "pending").length,
+    approved:  approvals.filter((p) => p.status === "approved").length,
+    executed:  approvals.filter((p) => p.status === "executed").length,
+    cancelled: approvals.filter((p) => p.status === "cancelled").length,
+  };
 
-  const ordered = [...pending, ...approved, ...others];
+  const filtered = approvals
+    .filter((p) => filter === "all" || p.status === filter)
+    .sort((a, b) => {
+      // pending → approved → executed → cancelled
+      const rank: Record<string, number> = { pending: 0, approved: 1, executed: 2, cancelled: 3 };
+      return (rank[a.status] ?? 9) - (rank[b.status] ?? 9);
+    });
+
+  const actionableCount = counts.pending + counts.approved;
 
   return (
     <SectionCard
@@ -413,9 +463,38 @@ export function ApprovalsClient({ initialApprovals }: { initialApprovals: AIOpsP
         </button>
       }
     >
-      {ordered.length ? (
-        <div className="divide-y divide-white/[0.05]">
-          {ordered.map((proposal) => (
+      {/* Filter bar */}
+      <div className="flex items-center gap-1.5 border-b border-white/[0.05] px-5 py-3">
+        {FILTER_OPTIONS.map(({ value, label }) => {
+          const count = value === "all" ? approvals.length : counts[value as keyof typeof counts];
+          const active = filter === value;
+          return (
+            <button
+              key={value}
+              onClick={() => setFilter(value)}
+              className={`inline-flex items-center gap-1.5 rounded px-2.5 py-1 text-[0.7rem] font-medium transition ${
+                active
+                  ? "bg-white/[0.08] text-slate-200"
+                  : "text-slate-500 hover:text-slate-300"
+              }`}
+            >
+              {label}
+              {count > 0 && (
+                <span className={`rounded px-1 text-[0.62rem] font-semibold ${
+                  active ? "bg-white/10 text-slate-300" : "text-slate-600"
+                }`}>
+                  {count}
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* List */}
+      {filtered.length ? (
+        <div className={`divide-y divide-white/[0.05] ${filter !== "all" && filter !== "pending" && filter !== "approved" ? "opacity-75" : ""}`}>
+          {filtered.map((proposal) => (
             <ProposalCard
               key={proposal.id}
               proposal={proposal}
@@ -424,12 +503,20 @@ export function ApprovalsClient({ initialApprovals }: { initialApprovals: AIOpsP
           ))}
         </div>
       ) : (
-        <div className="px-4 py-12 text-center">
+        <div className="px-4 py-10 text-center">
           <ShieldAlert className="mx-auto h-8 w-8 text-slate-700" />
-          <p className="mt-3 text-[0.84rem] font-medium text-slate-400">No pending proposals</p>
-          <p className="mt-1 text-[0.76rem] text-slate-600">
-            Proposals appear here after AI troubleshooting identifies a config-fixable issue.
-          </p>
+          {actionableCount === 0 && filter === "all" ? (
+            <>
+              <p className="mt-3 text-[0.84rem] font-medium text-slate-400">No pending proposals</p>
+              <p className="mt-1 text-[0.76rem] text-slate-600">
+                Proposals appear here after AI troubleshooting identifies a config-fixable issue.
+              </p>
+            </>
+          ) : (
+            <p className="mt-3 text-[0.84rem] font-medium text-slate-400">
+              No {filter} proposals
+            </p>
+          )}
         </div>
       )}
     </SectionCard>

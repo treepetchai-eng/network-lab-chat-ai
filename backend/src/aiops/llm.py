@@ -131,6 +131,21 @@ def _incident_context_text(incident: dict[str, Any]) -> str:
     )
 
 
+def _format_steps_for_synthesis(steps: list[dict[str, Any]]) -> str:
+    """Format CLI steps into a structured evidence block for the synthesis prompt."""
+    if not steps:
+        return "No CLI commands were executed."
+    lines: list[str] = []
+    cli_steps = [s for s in steps if s.get("tool_name") == "run_cli"]
+    for i, step in enumerate(cli_steps, 1):
+        cmd = (step.get("args") or {}).get("command", "?")
+        output = (step.get("content") or "").strip()
+        lines.append(f"[Command {i}] {cmd}")
+        lines.append(output or "(empty output)")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def _rewrite_troubleshoot_result(result: dict[str, Any], incident: dict[str, Any]) -> dict[str, Any]:
     source = incident.get("primary_hostname") or incident["primary_source_ip"]
     disposition = result.get("disposition", "needs_human_review")
@@ -562,90 +577,82 @@ def run_llm_troubleshoot(
     if _llm_enabled():
         try:
             with _llm_slot():
-                model = create_chat_model(reasoning=True).bind_tools(tools)
+                # ── Phase 1: Evidence gathering (agentic tool loop) ──────────────────
+                # System prompt focused ONLY on investigation — no decision rules here.
+                # Keeping this prompt short and focused prevents the model from conflating
+                # "collect evidence" with "decide disposition" in the same cognitive step.
+                investigation_model = create_chat_model(reasoning=True).bind_tools(tools)
                 messages: list[Any] = [
                     SystemMessage(
                         content=(
-                            "You are an LLM-first network troubleshooting agent operating as a senior network engineer. "
-                            "Your job is to turn incident evidence into an engineer-grade assessment using read-only investigation only. "
-                            "Use the target device role, site, platform, and version to shape your troubleshooting path and conclusion. "
-                            "Write like an expert who understands routing, failover, adjacency state, underlay versus overlay dependency, and operational risk. "
-                            "Use tools when needed. Only read-only investigation is allowed. "
-                            "CRITICAL TOOL USAGE RULES: "
-                            "1. The 'command' argument to run_cli must be a single, complete IOS EXEC command on ONE line. "
-                            "   ALWAYS include the full command verb. Examples: 'show interface Tunnel10', 'show ip eigrp neighbors', 'show ip route'. "
-                            "2. NEVER pass a bare interface name like 'tunnel10' or 'GigabitEthernet0/1' as the command — that is NOT a valid IOS command. "
-                            "3. NEVER embed newlines or multiple commands in a single 'command' argument — send one command per tool call. "
-                            "4. When referencing interfaces in commands, always use the full form: 'show interface Tunnel10' not 'sh int tu10'. "
-                            "5. If run_cli returns only the device header with no output below it, the command may be unsupported or returned empty. "
-                            "   Try a different related command rather than repeating the same one. "
-                            "Prefer lightweight commands such as 'show interface Tunnel10', 'show ip bgp summary', "
-                            "'show ip ospf neighbor', 'show ip eigrp neighbors', 'show track', 'show ip route'. "
-                            "\n"
-                            "DISPOSITION DECISION RULES — apply these BEFORE defaulting to needs_human_review:\n"
-                            "Rule 1 — ADMINISTRATIVELY DOWN = config_fix_possible:\n"
-                            "  If 'show interface' output contains '<intf> is administratively down', the interface was manually shut down by a human.\n"
-                            "  This is ALWAYS config_fix_possible. The fix is exactly: ['interface <intf>', 'no shutdown'].\n"
-                            "  rollback_commands: ['interface <intf>', 'shutdown'].\n"
-                            "  verification_commands: ['show interface <intf>'] plus the relevant protocol neighbor command.\n"
-                            "  Do NOT return needs_human_review when you see 'administratively down' — the cause is unambiguous.\n"
-                            "Rule 2 — PROTOCOL NEIGHBOR TIMEOUT = monitor_further or config_fix_possible:\n"
-                            "  If OSPF/BGP/EIGRP neighbor is missing and the interface is up/up (not admin-down), run 'show ip ospf neighbor' / 'show ip bgp summary'.\n"
-                            "  If interface is up and neighbor count is 0, check timers — return monitor_further unless a clear config issue is found.\n"
-                            "Rule 3 — INTERFACE PHYSICALLY DOWN = physical_issue or needs_human_review:\n"
-                            "  If 'show interface' output contains '<intf> is down, line protocol is down' without 'administratively', this may be physical. Return physical_issue.\n"
-                            "Rule 4 — SELF-RECOVERED:\n"
-                            "  If syslog shows a 'down' event followed by 'up' and the current CLI output shows the interface/neighbor is up, return self_recovered.\n"
-                            "Rule 5 — ONLY use needs_human_review when evidence is truly ambiguous — CLI output is inconsistent, multiple conflicting signals, or you cannot determine root cause.\n"
-                            "\n"
-                            "When you are done, return strict JSON with keys: disposition, summary, "
-                            "conclusion, proposed_fix_title, proposed_fix_rationale, proposed_commands, "
-                            "rollback_commands, rollback_plan, expected_impact, verification_commands. "
-                            "proposed_commands: ordered list of IOS config-mode command strings that Netmiko will send via send_config_set() — "
-                            "do NOT include 'configure terminal' or 'end' (Netmiko adds those automatically). "
-                            "Each command must be fully self-contained: if a command is interface-specific, always include the navigation "
-                            "line first, e.g. ['interface GigabitEthernet0/2', 'no shutdown']. "
-                            "For routing changes include the correct config context: ['router ospf 10', 'network 10.0.0.0 0.0.0.255 area 0']. "
-                            "rollback_commands: ordered list with the same navigation rules, performing the exact inverse of proposed_commands. "
-                            "rollback_plan: plain-text description of what the rollback does and when to trigger it. "
-                            "verification_commands: list of IOS exec-mode show commands (NOT config-mode) to confirm the fix worked. "
-                            "The summary must read like a senior engineer status note. "
-                            "The conclusion must read like a senior engineer judgment that clearly states whether to monitor, escalate, or propose remediation. "
-                            "If the evidence points to physical or provider fault, say so directly and avoid configuration suggestions. "
-                            "If you propose configuration changes, keep them minimal, reversible, and tied to the evidence. "
-                            "Disposition must be one of self_recovered, monitor_further, physical_issue, "
-                            "external_issue, config_fix_possible, needs_human_review."
+                            "You are a network troubleshooting agent. "
+                            "Your ONLY task right now is to collect CLI evidence from the affected device. "
+                            "Use read-only commands only. Do NOT make a final diagnosis yet — just gather facts. "
+                            "TOOL RULES: "
+                            "1. run_cli 'command' must be a single, complete IOS EXEC command on one line. "
+                            "2. NEVER pass a bare interface name as a command — always prefix with 'show interface'. "
+                            "3. NEVER embed newlines in a single command argument. "
+                            "4. Use full interface names: 'show interface GigabitEthernet0/2' not 'sh int gi0/2'. "
+                            "5. If a command returns empty, try a closely related alternative instead of repeating. "
+                            "Preferred commands: 'show interface <intf>', 'show ip ospf neighbor', "
+                            "'show ip bgp summary', 'show ip eigrp neighbors', 'show track', 'show ip route'. "
+                            "When you have enough CLI evidence, stop calling tools and reply with: INVESTIGATION_COMPLETE"
                         )
                     ),
                     HumanMessage(content=json.dumps(prompt, ensure_ascii=False)),
                 ]
                 steps: list[dict[str, Any]] = []
-                final_text = ""
                 for iteration in range(5):
-                    reply = model.invoke(messages)
+                    reply = investigation_model.invoke(messages)
                     messages.append(reply)
                     tool_calls = getattr(reply, "tool_calls", None) or []
                     if not tool_calls:
-                        final_text = str(getattr(reply, "content", "") or "")
                         break
                     for tool_call in tool_calls:
-                        tool_name, result = _execute_tool(tool_map, tool_call)
+                        tool_name, tool_result = _execute_tool(tool_map, tool_call)
                         steps.append({
                             "tool_name": tool_name,
                             "args": tool_call.get("args", {}),
-                            "content": result,
+                            "content": tool_result,
                         })
-                        messages.append(ToolMessage(content=result, tool_call_id=tool_call["id"], name=tool_name))
-                else:
-                    # Max iterations reached — ask LLM for final JSON summary without tools
-                    logger.warning("run_llm_troubleshoot: max iterations reached for %s, requesting final answer", incident.get("incident_no"))
-                    messages.append(HumanMessage(content=(
-                        "You have used the maximum number of tool calls. "
-                        "Based on all evidence gathered so far, provide your final assessment as strict JSON now. "
-                        "Do not call any more tools."
-                    )))
-                    nudge_reply = model.invoke(messages)
-                    final_text = str(getattr(nudge_reply, "content", "") or "")
+                        messages.append(ToolMessage(content=tool_result, tool_call_id=tool_call["id"], name=tool_name))
+
+            # ── Phase 2: Synthesis — dedicated focused LLM call ──────────────────
+            # Evidence from Phase 1 is formatted and given as explicit structured input.
+            # Decision rules are front-loaded in a compact prompt with no distractions.
+            evidence_text = _format_steps_for_synthesis(steps)
+            synthesis_prompt = (
+                f"INCIDENT: {_incident_context_text(incident)}\n"
+                f"SYSLOG: {'; '.join(row['raw_message'] for row in logs[:4])}\n\n"
+                f"CLI EVIDENCE COLLECTED:\n{evidence_text}\n"
+                "---\n"
+                "Apply these rules IN ORDER to the CLI evidence above:\n"
+                "1. If ANY interface shows 'administratively down' → disposition = config_fix_possible\n"
+                "   Fix: ['interface <intf>', 'no shutdown']  Rollback: ['interface <intf>', 'shutdown']\n"
+                "2. If interface is 'down, line protocol is down' (no 'administratively') → disposition = physical_issue\n"
+                "3. If interface/neighbor is currently UP in CLI but syslog showed it down earlier → disposition = self_recovered\n"
+                "4. If routing neighbor is missing but interface is up/up → disposition = monitor_further\n"
+                "5. Only use needs_human_review if the evidence is genuinely contradictory or missing.\n\n"
+                "Return ONLY strict JSON with keys:\n"
+                "disposition, summary, conclusion,\n"
+                "proposed_fix_title, proposed_fix_rationale,\n"
+                "proposed_commands, rollback_commands, rollback_plan,\n"
+                "expected_impact, verification_commands\n\n"
+                "proposed_commands / rollback_commands: IOS config-mode strings for Netmiko send_config_set() "
+                "(omit 'configure terminal' and 'end'). Always include interface navigation first if needed.\n"
+                "verification_commands: exec-mode show commands only (NOT config-mode)."
+            )
+            with _llm_slot():
+                synthesis_model = create_chat_model(reasoning=False)
+                synthesis_reply = synthesis_model.invoke([
+                    SystemMessage(content=(
+                        "You are a senior network engineer making a final diagnosis. "
+                        "You will be given CLI evidence already collected and a set of decision rules. "
+                        "Apply the rules strictly to the evidence. Return only JSON — no prose."
+                    )),
+                    HumanMessage(content=synthesis_prompt),
+                ])
+            final_text = str(getattr(synthesis_reply, "content", "") or "")
 
             data = _safe_json(final_text, {})
             if not data:
