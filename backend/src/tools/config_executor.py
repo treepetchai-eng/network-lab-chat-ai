@@ -1,4 +1,4 @@
-"""Approval-gated config execution helpers for network devices."""
+"""Approval-gated config execution and read-only verification helpers for network devices."""
 
 from __future__ import annotations
 
@@ -63,3 +63,45 @@ def execute_config(device_ip: str, os_platform: str, commands: list[str]) -> str
         return f"[TIMEOUT ERROR] {device_ip} (OS: {os_platform}): {exc}"
     except Exception as exc:
         return f"[CONFIG ERROR] {device_ip} (OS: {os_platform}): {exc}"
+
+
+def run_show_commands(device_ip: str, os_platform: str, commands: list[str]) -> str:
+    """Run read-only show commands on a device and return combined output.
+
+    Used for post-execution verification — never sends config, never modifies state.
+    """
+    username: str | None = os.getenv("ROUTER_USER")
+    password: str | None = os.getenv("ROUTER_PASS")
+    if not username or not password:
+        return (
+            f"[VERIFY ERROR] {device_ip}: ROUTER_USER or ROUTER_PASS is not set in .env"
+        )
+    if not commands:
+        return "[VERIFY SKIP] No verification commands provided."
+
+    try:
+        connection = ConnectHandler(
+            device_type=os_platform,
+            host=device_ip,
+            username=username,
+            password=password,
+            fast_cli=False,
+            conn_timeout=int(os.getenv("SSH_CONN_TIMEOUT", "10")),
+        )
+        try:
+            outputs: list[str] = []
+            for cmd in commands:
+                cmd = cmd.strip()
+                if not cmd:
+                    continue
+                result = connection.send_command(cmd, read_timeout=30)
+                outputs.append(f"--- {cmd} ---\n{result}")
+        finally:
+            connection.disconnect()
+        return "\n\n".join(outputs) or "[VERIFY OK] Commands returned empty output."
+    except NetmikoAuthenticationException as exc:
+        return f"[VERIFY AUTH ERROR] Authentication failed for {device_ip}: {exc}"
+    except NetmikoTimeoutException as exc:
+        return f"[VERIFY TIMEOUT] {device_ip}: {exc}"
+    except Exception as exc:
+        return f"[VERIFY ERROR] {device_ip}: {exc}"

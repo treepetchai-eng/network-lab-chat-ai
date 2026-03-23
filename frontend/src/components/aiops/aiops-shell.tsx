@@ -15,6 +15,7 @@ import { type ReactNode, Suspense } from "react";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
+import { fetchDashboard } from "@/lib/aiops-api";
 
 /* ── Nav structure ────────────────────────────────────────────────────── */
 const PRIMARY_NAV = [
@@ -37,9 +38,7 @@ function useLiveCounts(): Counts {
   useEffect(() => {
     const load = async () => {
       try {
-        const res = await fetch("/api/aiops/dashboard");
-        if (!res.ok) return;
-        const d = await res.json();
+        const d = await fetchDashboard();
         setCounts({
           active_incidents:  d.metrics?.active_incidents  ?? 0,
           pending_approvals: d.metrics?.pending_approvals ?? 0,

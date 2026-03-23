@@ -16,7 +16,7 @@ from psycopg.types.json import Json
 from src.aiops.db import connect, parse_database_urls
 from src.aiops.llm import decide_incident_bundle, generate_ai_summary, run_llm_troubleshoot
 from src.aiops.parser import parse_syslog
-from src.tools.config_executor import execute_config
+from src.tools.config_executor import execute_config, run_show_commands
 
 _INVENTORY_PATH = Path(__file__).parent.parent.parent / "inventory" / "inventory.csv"
 _OPEN_INCIDENT_STATUSES = (
@@ -36,7 +36,7 @@ _OPEN_INCIDENT_STATUSES = (
 _PIPELINE_STATUSES = ("pending_parse",)
 _GROUP_WINDOW = timedelta(minutes=10)
 # Event states the LLM may return to indicate recovery (not just "up")
-_RECOVERY_EVENT_STATES = frozenset({"up", "resolved", "recovered", "established", "restored", "cleared"})
+_RECOVERY_EVENT_STATES = frozenset({"up", "resolved", "recovered", "established", "restored", "cleared", "restart"})
 # Incident statuses that indicate the fault was previously considered over — a new DOWN event here is a re-fault
 _POST_RECOVERY_STATUSES = frozenset({"recovering", "monitoring", "resolved", "resolved_uncertain"})
 _GROUP_DECISION_DEBOUNCE = timedelta(seconds=max(1, int(os.getenv("AIOPS_GROUP_DECISION_DEBOUNCE_SECONDS", "5"))))
@@ -297,16 +297,33 @@ class AIOpsService:
         with connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(ddl)
-                cur.execute("ALTER TABLE raw_logs ADD COLUMN IF NOT EXISTS parse_status TEXT NOT NULL DEFAULT 'ingested'")
-                cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS parser_name TEXT NOT NULL DEFAULT 'heuristic_v1'")
-                cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS parser_confidence DOUBLE PRECISION NOT NULL DEFAULT 0.6")
-                cur.execute("ALTER TABLE candidate_groups ADD COLUMN IF NOT EXISTS decision_status TEXT NOT NULL DEFAULT 'idle'")
-                cur.execute("ALTER TABLE candidate_groups ADD COLUMN IF NOT EXISTS decision_requested_at TIMESTAMPTZ")
-                cur.execute("ALTER TABLE candidate_groups ADD COLUMN IF NOT EXISTS decision_attempts INTEGER NOT NULL DEFAULT 0")
-                cur.execute("ALTER TABLE candidate_groups ADD COLUMN IF NOT EXISTS decision_locked_at TIMESTAMPTZ")
-                cur.execute("ALTER TABLE candidate_groups ADD COLUMN IF NOT EXISTS last_decision_event_count INTEGER NOT NULL DEFAULT 0")
                 cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS incident_events_incident_id_event_id_idx ON incident_events (incident_id, event_id)")
                 cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS candidate_group_events_group_id_event_id_idx ON candidate_group_events (candidate_group_id, event_id)")
+                # Column migrations — check existence first to avoid AccessExclusiveLock
+                # deadlocks when the server is already running with active transactions.
+                _col_migrations: list[tuple[str, str, str]] = [
+                    ("raw_logs",         "parse_status",                "TEXT NOT NULL DEFAULT 'ingested'"),
+                    ("events",           "parser_name",                 "TEXT NOT NULL DEFAULT 'heuristic_v1'"),
+                    ("events",           "parser_confidence",           "DOUBLE PRECISION NOT NULL DEFAULT 0.6"),
+                    ("candidate_groups", "decision_status",             "TEXT NOT NULL DEFAULT 'idle'"),
+                    ("candidate_groups", "decision_requested_at",       "TIMESTAMPTZ"),
+                    ("candidate_groups", "decision_attempts",           "INTEGER NOT NULL DEFAULT 0"),
+                    ("candidate_groups", "decision_locked_at",          "TIMESTAMPTZ"),
+                    ("candidate_groups", "last_decision_event_count",   "INTEGER NOT NULL DEFAULT 0"),
+                    ("proposals",        "rollback_commands",           "JSONB NOT NULL DEFAULT '[]'::jsonb"),
+                ]
+                cur.execute(
+                    """
+                    SELECT table_name, column_name
+                    FROM information_schema.columns
+                    WHERE table_name = ANY(%s)
+                    """,
+                    ([t for t, _, _ in _col_migrations],),
+                )
+                existing_cols: set[tuple[str, str]] = {(r["table_name"], r["column_name"]) for r in cur.fetchall()}
+                for table, col, col_def in _col_migrations:
+                    if (table, col) not in existing_cols:
+                        cur.execute(f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {col_def}')
             conn.commit()
 
     def sync_inventory(self) -> None:
@@ -341,7 +358,7 @@ class AIOpsService:
             conn.commit()
 
     def _recover_stuck_groups(self) -> None:
-        """Reset candidate groups stuck in 'running' state from a previous crash."""
+        """Reset candidate groups stuck in 'running' for more than 5 minutes (crashed worker)."""
         with connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -352,12 +369,13 @@ class AIOpsService:
                         decision_requested_at = NOW(),
                         updated_at = NOW()
                     WHERE decision_status = 'running'
+                      AND decision_locked_at < NOW() - INTERVAL '5 minutes'
                     """
                 )
                 recovered = cur.rowcount
             conn.commit()
         if recovered:
-            logger.info("Recovered %d stuck candidate_group(s) at startup", recovered)
+            logger.info("Recovered %d stuck candidate_group(s) after lock timeout", recovered)
 
     def _fetch_device_cache(self) -> dict[str, dict[str, Any]]:
         with connect() as conn:
@@ -619,6 +637,21 @@ class AIOpsService:
                     if raw_log is None:
                         raise KeyError(f"Raw log {job['raw_log_id']} not found")
                     device = self._find_device(cur, source_ip=raw_log["source_ip"], hostname=raw_log["hostname"])
+                    if device is None:
+                        # Source IP not in inventory — discard silently.
+                        # Unknown IPs may be test packets, misconfigured devices, or spoofed sources.
+                        # Do not create events or incidents; store as unknown_source for audit.
+                        logger.debug(
+                            "Discarding log from unknown source IP=%s hostname=%s — not in inventory",
+                            raw_log["source_ip"], raw_log["hostname"],
+                        )
+                        cur.execute(
+                            "UPDATE raw_logs SET parse_status = 'unknown_source' WHERE id = %s",
+                            (raw_log["id"],),
+                        )
+                        conn.commit()
+                        self._complete_job(job["id"], status="completed")
+                        return True
                     parsed = parse_syslog(
                         source_ip=raw_log["source_ip"],
                         hostname=raw_log["hostname"],
@@ -626,17 +659,7 @@ class AIOpsService:
                         event_time=raw_log["event_time"],
                     )
                     if parsed is None:
-                        # Noise / boot banner — mark as parsed but skip event creation
-                        cur.execute(
-                            "UPDATE raw_logs SET parse_status = 'noise' WHERE id = %s",
-                            (raw_log["id"],),
-                        )
-                        conn.commit()
-                        self._complete_job(job["id"], status="completed")
-                        return True
-                    # admin_down events (interface shutdown by operator) are informational only
-                    # — do not create incidents since there's no recovery path
-                    if parsed["event_state"] == "admin_down":
+                        # Noise / boot banner / admin-down — parser already decided to discard
                         cur.execute(
                             "UPDATE raw_logs SET parse_status = 'noise' WHERE id = %s",
                             (raw_log["id"],),
@@ -710,8 +733,10 @@ class AIOpsService:
                         )
                         if not merged:
                             self._mark_candidate_group_pending_decision(cur, group_id=group["id"])
-                    # Short-circuit: recovery signals skip LLM and update incident directly
-                    elif event["event_state"] in ("up", "restart") and event["event_family"] not in ("system", "config"):
+                    # Short-circuit: recovery signals skip LLM and update incident directly.
+                    # Covers all healed states: up, established, recovered, restored, cleared.
+                    # Config events are never recovery signals. System events (restart) go via LLM.
+                    elif event["metadata"].get("recovery_signal") and event["event_family"] not in ("system", "config"):
                         self._apply_recovery_signal(cur, event=event, raw_log=raw_log, group=group)
                     else:
                         self._mark_candidate_group_pending_decision(cur, group_id=group["id"])
@@ -752,12 +777,13 @@ class AIOpsService:
             # No matching open incident → let LLM decide
             self._mark_candidate_group_pending_decision(cur, group_id=group["id"])
             return
-        # Update incident to recovering
+        # Update incident to recovering and bump event count
         cur.execute(
             """
             UPDATE incidents
             SET status = 'recovering',
                 current_recovery_state = 'signal_detected',
+                event_count = event_count + 1,
                 last_seen_at = NOW(),
                 updated_at = NOW()
             WHERE id = %s
@@ -1517,7 +1543,7 @@ class AIOpsService:
                 claimed_event_count,
                 claimed_event_count,
                 datetime.now(timezone.utc) + _GROUP_DECISION_DEBOUNCE,
-                "ignored" if decision["action"] == "ignore" else "open",
+                "idle" if decision["action"] == "ignore" else "open",
                 group["id"],
             ),
         )
@@ -2029,33 +2055,7 @@ class AIOpsService:
                         result["raw_response"],
                     ),
                 )
-                status_map = {
-                    "self_recovered": ("monitoring", "self_recovered"),
-                    "monitor_further": ("investigating", None),
-                    "physical_issue": ("escalated", "physical_handoff"),
-                    "external_issue": ("escalated", "external_handoff"),
-                    "config_fix_possible": ("awaiting_approval", None),
-                    "needs_human_review": ("active", None),
-                }
-                next_status, resolution_type = status_map.get(result["disposition"], ("active", None))
-                cur.execute(
-                    """
-                    UPDATE incidents
-                    SET status = %s,
-                        resolution_type = COALESCE(%s, resolution_type),
-                        updated_at = NOW()
-                    WHERE id = %s
-                    """,
-                    (next_status, resolution_type, incident["id"]),
-                )
-                self._record_timeline(
-                    cur,
-                    incident["id"],
-                    "troubleshoot",
-                    "AI troubleshooting completed",
-                    result["summary"],
-                    {"disposition": result["disposition"]},
-                )
+                # Build proposal first — status depends on whether one was actually created
                 proposal = None
                 if result.get("proposal"):
                     proposal_data = result["proposal"]
@@ -2067,9 +2067,10 @@ class AIOpsService:
                         """
                         INSERT INTO proposals (
                             incident_id, title, rationale, target_devices, commands,
-                            rollback_plan, expected_impact, verification_commands, risk_level
+                            rollback_commands, rollback_plan, expected_impact,
+                            verification_commands, risk_level
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         RETURNING *
                         """,
                         (
@@ -2078,21 +2079,68 @@ class AIOpsService:
                             proposal_data["rationale"],
                             Json(target_devices),
                             Json(proposal_data["commands"]),
-                            proposal_data["rollback_plan"],
-                            proposal_data["expected_impact"],
-                            Json(proposal_data["verification_commands"]),
+                            Json(proposal_data.get("rollback_commands") or []),
+                            proposal_data.get("rollback_plan") or "",
+                            proposal_data.get("expected_impact") or "",
+                            Json(proposal_data.get("verification_commands") or []),
                             proposal_data.get("risk_level", "medium"),
                         ),
                     )
                     proposal = cur.fetchone()
+
+                # Determine next incident status based on disposition + whether proposal was created
+                disposition = result["disposition"]
+                status_map = {
+                    "self_recovered": ("monitoring", "self_recovered"),
+                    "monitor_further": ("investigating", None),
+                    "physical_issue": ("escalated", "physical_handoff"),
+                    "external_issue": ("escalated", "external_handoff"),
+                    "config_fix_possible": ("awaiting_approval" if proposal else "active", None),
+                    "needs_human_review": ("active", None),
+                }
+                next_status, resolution_type = status_map.get(disposition, ("active", None))
+                # Re-fetch current status — a recovery signal may have arrived while
+                # troubleshoot was running and already advanced the incident to
+                # "recovering" or "monitoring".  Never downgrade those states.
+                _RECOVERY_FORWARD_STATUSES = frozenset({"recovering", "monitoring", "resolved", "resolved_uncertain"})
+                cur.execute("SELECT status FROM incidents WHERE id = %s", (incident["id"],))
+                current_row = cur.fetchone()
+                current_status = current_row["status"] if current_row else None
+                if current_status in _RECOVERY_FORWARD_STATUSES and next_status not in _RECOVERY_FORWARD_STATUSES:
+                    # Preserve the recovery-forward status; only log the troubleshoot result
+                    next_status = current_status
+                if proposal:
                     cur.execute(
                         """
                         UPDATE incidents
-                        SET current_proposal_id = %s, status = 'awaiting_approval', updated_at = NOW()
+                        SET status = 'awaiting_approval',
+                            current_proposal_id = %s,
+                            resolution_type = COALESCE(%s, resolution_type),
+                            updated_at = NOW()
                         WHERE id = %s
                         """,
-                        (proposal["id"], incident["id"]),
+                        (proposal["id"], resolution_type, incident["id"]),
                     )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE incidents
+                        SET status = %s,
+                            resolution_type = COALESCE(%s, resolution_type),
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (next_status, resolution_type, incident["id"]),
+                    )
+                self._record_timeline(
+                    cur,
+                    incident["id"],
+                    "troubleshoot",
+                    "AI troubleshooting completed",
+                    result["summary"],
+                    {"disposition": disposition},
+                )
+                if proposal:
                     self._record_timeline(
                         cur,
                         incident["id"],
@@ -2146,8 +2194,12 @@ class AIOpsService:
         if proposal is None:
             raise KeyError(f"No proposal found for incident {incident_no}")
         commands = proposal["commands"] or []
+        rollback_commands = proposal.get("rollback_commands") or []
+        verification_commands = proposal.get("verification_commands") or []
         target_devices = proposal["target_devices"] or []
         device_cache = self._fetch_device_cache()
+
+        # ── Phase 1: Apply config changes ─────────────────────────────────────
         outputs: list[str] = []
         status = "completed"
         for name in target_devices:
@@ -2158,16 +2210,42 @@ class AIOpsService:
             device = device_cache[name]
             output = execute_config(device["ip_address"], device["os_platform"], commands)
             outputs.append(output)
-            if output.startswith("["):
+            if not output.startswith("[CONFIG APPLIED]"):
                 status = "failed"
+
+        # ── Phase 2a: Auto-rollback on execution failure ───────────────────────
+        if status == "failed" and rollback_commands:
+            rollback_outputs: list[str] = []
+            for name in target_devices:
+                if name not in device_cache:
+                    continue
+                device = device_cache[name]
+                rb_out = execute_config(device["ip_address"], device["os_platform"], rollback_commands)
+                rollback_outputs.append(rb_out)
+            outputs.append("[ROLLBACK TRIGGERED]\n" + "\n".join(rollback_outputs))
+
+        # ── Phase 2b: Auto-verify on execution success ─────────────────────────
         verification_status = "pending"
         verification_notes = "Manual verification required."
+        if status == "completed" and verification_commands:
+            verify_parts: list[str] = []
+            for name in target_devices:
+                if name not in device_cache:
+                    continue
+                device = device_cache[name]
+                v_out = run_show_commands(device["ip_address"], device["os_platform"], verification_commands)
+                verify_parts.append(v_out)
+            if verify_parts:
+                verification_status = "auto_checked"
+                verification_notes = "\n\n".join(verify_parts)
+
         with connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO executions (
-                        incident_id, proposal_id, status, executed_by, output, verification_status, verification_notes, completed_at
+                        incident_id, proposal_id, status, executed_by, output,
+                        verification_status, verification_notes, completed_at
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
                     RETURNING *
@@ -2183,22 +2261,28 @@ class AIOpsService:
                     ),
                 )
                 execution = cur.fetchone()
+                # failed + rollback → back to active; success → verifying
                 next_status = "verifying" if status == "completed" else "active"
                 cur.execute(
-                    """
-                    UPDATE incidents
-                    SET status = %s, updated_at = NOW()
-                    WHERE id = %s
-                    """,
+                    "UPDATE incidents SET status = %s, updated_at = NOW() WHERE id = %s",
                     (next_status, incident["id"]),
                 )
+                cur.execute(
+                    "UPDATE proposals SET status = 'executed' WHERE id = %s",
+                    (proposal["id"],),
+                )
+                timeline_note = f"Execution status: {status}"
+                if status == "failed" and rollback_commands:
+                    timeline_note += " — rollback commands automatically applied"
+                elif status == "completed" and verification_status == "auto_checked":
+                    timeline_note += " — verification commands collected automatically"
                 self._record_timeline(
                     cur,
                     incident["id"],
                     "execution",
                     "Approved commands executed",
-                    f"Execution status: {status}",
-                    {"execution_id": execution["id"], "actor": actor},
+                    timeline_note,
+                    {"execution_id": execution["id"], "actor": actor, "auto_verified": verification_status == "auto_checked"},
                 )
             conn.commit()
         return self.get_incident(incident_no)
@@ -2206,7 +2290,11 @@ class AIOpsService:
     def verify_recovery(self, incident_no: str, healed: bool, note: str) -> dict[str, Any]:
         detail = self.get_incident(incident_no)
         incident = detail["incident"]
-        next_status = "resolved" if healed else "monitoring"
+        # healed=False from verifying state → re-open as active for re-investigation
+        if not healed and incident.get("status") == "verifying":
+            next_status = "active"
+        else:
+            next_status = "resolved" if healed else "monitoring"
         resolution_type = "verified_recovery" if healed else None
         with connect() as conn:
             with conn.cursor() as cur:
@@ -2231,5 +2319,4 @@ class AIOpsService:
                     {"healed": healed},
                 )
             conn.commit()
-        return self.get_incident(incident_no)
         return self.get_incident(incident_no)

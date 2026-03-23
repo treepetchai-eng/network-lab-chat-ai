@@ -11,11 +11,12 @@ import {
   TrendingUp,
 } from "lucide-react";
 import { MetricCard } from "@/components/aiops/metric-card";
+import { ProposalCard } from "@/components/aiops/approvals-client";
 import { ResetIncidentsButton } from "@/components/aiops/reset-incidents-button";
 import { SectionCard } from "@/components/aiops/section-card";
 import { StatusBadge } from "@/components/aiops/status-badge";
 import { fetchDashboard, fetchLogs } from "@/lib/aiops-api";
-import type { AIOpsDashboardPayload, AIOpsLogsPayload } from "@/lib/aiops-types";
+import type { AIOpsDashboardPayload, AIOpsLogsPayload, AIOpsProposal } from "@/lib/aiops-types";
 
 const POLL_INTERVAL = 30_000;
 
@@ -42,6 +43,7 @@ interface Props {
 
 export function DashboardClient({ initialDashboard, initialLogs }: Props) {
   const [dashboard, setDashboard] = useState(initialDashboard);
+  const [approvals, setApprovals] = useState(initialDashboard.approvals);
   const [logs, setLogs]           = useState(initialLogs);
   const [lastRefresh, setLastRefresh] = useState<number | null>(null);
   useEffect(() => { setLastRefresh(Date.now()); }, []);
@@ -52,6 +54,7 @@ export function DashboardClient({ initialDashboard, initialLogs }: Props) {
     try {
       const [d, l] = await Promise.all([fetchDashboard(), fetchLogs()]);
       setDashboard(d);
+      setApprovals(d.approvals);
       setLogs(l);
       setLastRefresh(Date.now());
     } catch { /* ignore */ } finally {
@@ -196,20 +199,16 @@ export function DashboardClient({ initialDashboard, initialLogs }: Props) {
         <div className="space-y-5">
           {/* Approval queue */}
           <SectionCard title="Approval Queue" eyebrow="Change Control" noPadding>
-            {dashboard.approvals.length ? (
+            {approvals.length ? (
               <div className="divide-y divide-white/[0.05]">
-                {dashboard.approvals.map((p) => (
-                  <Link
+                {approvals.map((p) => (
+                  <ProposalCard
                     key={p.id}
-                    href={`/aiops/incidents/${p.incident_no}`}
-                    className="flex items-center justify-between gap-3 px-4 py-3 transition hover:bg-white/[0.04]"
-                  >
-                    <div className="min-w-0">
-                      <p className="truncate text-[0.82rem] font-semibold text-slate-100">{p.title}</p>
-                      <p className="text-[0.72rem] text-slate-500">{p.incident_no}</p>
-                    </div>
-                    <StatusBadge value={p.status} />
-                  </Link>
+                    proposal={p}
+                    onDone={(updated: AIOpsProposal) =>
+                      setApprovals((prev) => prev.map((x) => (x.id === updated.id ? updated : x)))
+                    }
+                  />
                 ))}
               </div>
             ) : (

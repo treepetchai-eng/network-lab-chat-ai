@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
@@ -8,14 +9,16 @@ import threading
 from contextlib import contextmanager
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
-from src.aiops.parser import parse_syslog
 from src.llm_factory import create_chat_model
 from src.tools.cli_tool import create_run_cli_tool
 from src.tools.inventory_tools import list_all_devices, lookup_device
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+
 _AIOPS_LLM_CONCURRENCY = max(1, int(os.getenv("AIOPS_LLM_CONCURRENCY", "1")))
 _AIOPS_LLM_SLOT = threading.Semaphore(_AIOPS_LLM_CONCURRENCY)
 
@@ -60,10 +63,10 @@ def _device_context(device: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _device_context_text(device: dict[str, Any] | None) -> str:
+    if not device:
+        return "No inventory match was found for this source."
     facts = _device_context(device)
     if not any(facts.values()):
-        return "No inventory match was found for this source."
-    if not device:
         return "No inventory match was found for this source."
     return (
         f"hostname={facts['hostname']}, "
@@ -307,82 +310,6 @@ def _llm_enabled() -> bool:
     return True
 
 
-def decide_incident_action(
-    *,
-    source_ip: str,
-    hostname: str | None,
-    raw_message: str,
-    event_time: Any,
-    device: dict[str, Any] | None,
-    open_incidents: list[dict[str, Any]],
-) -> dict[str, Any]:
-    fallback = _fallback_incident_decision(
-        source_ip=source_ip,
-        hostname=hostname,
-        raw_message=raw_message,
-        event_time=event_time,
-        device=device,
-        open_incidents=open_incidents,
-    )
-    if not _llm_enabled():
-        return fallback
-
-    prompt = {
-        "device": _device_context(device),
-        "device_context": _device_context_text(device),
-        "source_ip": source_ip,
-        "hostname": hostname,
-        "raw_message": raw_message,
-        "event_time": str(event_time),
-        "open_incidents": [
-            {
-                "incident_no": item["incident_no"],
-                "title": item["title"],
-                "status": item["status"],
-                "event_family": item["event_family"],
-                "correlation_key": item["correlation_key"],
-                "primary_source_ip": item["primary_source_ip"],
-            }
-            for item in open_incidents[:12]
-        ],
-        "open_incident_context": _open_incident_context_text(open_incidents),
-    }
-    try:
-        with _llm_slot():
-            model = create_chat_model(reasoning=False)
-            response = model.invoke([
-                SystemMessage(
-                    content=(
-                        "You are the incident-decision engine for a network AIOps platform and you must think like a senior network operations engineer. "
-                        "Treat the raw syslog as operational evidence, not just text classification input. "
-                        "Use device identity, site, role, platform, and version to decide whether this event is operationally significant. "
-                        "Correlate with currently open incidents only when the source, technology domain, and failure pattern genuinely align. "
-                        "Prefer precise operational language such as adjacency loss, tunnel instability, tracked-path transition, or interface state change. "
-                        "Avoid vague wording like issue detected, problem happened, or something may be wrong. "
-                        "If the evidence is weak, you may still create an incident, but the summary must sound like a measured engineering hypothesis. "
-                        "Return strict JSON with keys: action, incident_no, title, event_family, event_state, severity, "
-                        "summary, correlation_key, category, reasoning, metadata. "
-                        "Valid action values: create_incident, update_incident, ignore. "
-                        "Valid categories: physical, logical, config-related, external, unknown. "
-                        "The reasoning field should explain the operational basis for the decision in 1-3 concise engineer-style sentences."
-                    )
-                ),
-                HumanMessage(content=json.dumps(prompt, ensure_ascii=False)),
-            ])
-        text = str(getattr(response, "content", "") or "")
-        parsed = _safe_json(text, {})
-        if parsed:
-            parsed["raw_response"] = text
-            for key, value in fallback.items():
-                parsed.setdefault(key, value)
-            if parsed.get("action") not in {"create_incident", "update_incident", "ignore"}:
-                parsed["action"] = fallback["action"]
-            return parsed
-    except Exception:
-        pass
-    return fallback
-
-
 def decide_incident_bundle(
     *,
     candidate_group: dict[str, Any],
@@ -453,70 +380,36 @@ def decide_incident_bundle(
         ],
         "open_incident_context": _open_incident_context_text(open_incidents),
     }
-    try:
-        with _llm_slot():
-            model = create_chat_model(reasoning=False)
-            response = model.invoke([
-                SystemMessage(
-                    content=(
-                        "You are the incident-decision engine for a network AIOps platform and you reason from grouped evidence, not a single log line. "
-                        "You are given a candidate group of related network events that were pre-grouped deterministically by correlation hints and time window. "
-                        "Your task is to decide whether this candidate should create a new incident, update an existing incident, merge into an open incident, or be ignored. "
-                        "Use device role, site, platform, recovery signals, and the sequence of events to judge whether this is a real operational thread. "
-                        "Treat the pre-grouping as a helpful bundle, not as final truth. "
-                        "Return strict JSON with keys: action, incident_no, title, event_family, event_state, severity, summary, correlation_key, category, reasoning, metadata. "
-                        "Valid action values: create_incident, update_incident, ignore. "
-                        "Valid categories: physical, logical, config-related, external, unknown."
-                    )
-                ),
-                HumanMessage(content=json.dumps(prompt, ensure_ascii=False)),
-            ])
-        text = str(getattr(response, "content", "") or "")
-        parsed = _safe_json(text, {})
-        if parsed:
-            parsed["raw_response"] = text
-            for key, value in fallback.items():
-                parsed.setdefault(key, value)
-            if parsed.get("action") not in {"create_incident", "update_incident", "ignore"}:
-                parsed["action"] = fallback["action"]
-            return parsed
-    except Exception:
-        pass
-    return fallback
-
-
-def _fallback_incident_decision(
-    *,
-    source_ip: str,
-    hostname: str | None,
-    raw_message: str,
-    event_time: Any,
-    device: dict[str, Any] | None,
-    open_incidents: list[dict[str, Any]],
-) -> dict[str, Any]:
-    parsed = parse_syslog(source_ip=source_ip, hostname=hostname, raw_message=raw_message, event_time=event_time)
-    matched_incident = next(
-        (
-            item for item in open_incidents
-            if item["correlation_key"] == parsed["correlation_key"]
-        ),
-        None,
+    sys_msg = SystemMessage(
+        content=(
+            "You are the incident-decision engine for a network AIOps platform and you reason from grouped evidence, not a single log line. "
+            "You are given a candidate group of related network events that were pre-grouped deterministically by correlation hints and time window. "
+            "Your task is to decide whether this candidate should create a new incident, update an existing incident, merge into an open incident, or be ignored. "
+            "Use device role, site, platform, recovery signals, and the sequence of events to judge whether this is a real operational thread. "
+            "Treat the pre-grouping as a helpful bundle, not as final truth. "
+            "Return strict JSON with keys: action, incident_no, title, event_family, event_state, severity, summary, correlation_key, category, reasoning, metadata. "
+            "Valid action values: create_incident, update_incident, ignore. "
+            "Valid categories: physical, logical, config-related, external, unknown."
+        )
     )
-    category = "physical" if parsed["event_family"] in {"device_health", "interface"} else "logical"
-    return {
-        "action": "update_incident" if matched_incident else "create_incident",
-        "incident_no": matched_incident["incident_no"] if matched_incident else None,
-        "title": parsed["title"],
-        "event_family": parsed["event_family"],
-        "event_state": parsed["event_state"],
-        "severity": parsed["severity"],
-        "summary": parsed["summary"],
-        "correlation_key": parsed["correlation_key"],
-        "category": category,
-        "reasoning": "Fallback incident decision based on parser heuristics because the LLM decision layer was unavailable.",
-        "metadata": parsed["metadata"],
-        "raw_response": "",
-    }
+    for _attempt in range(2):
+        try:
+            with _llm_slot():
+                model = create_chat_model(reasoning=False)
+                response = model.invoke([sys_msg, HumanMessage(content=json.dumps(prompt, ensure_ascii=False))])
+            text = str(getattr(response, "content", "") or "")
+            parsed = _safe_json(text, {})
+            if parsed:
+                parsed["raw_response"] = text
+                for key, value in fallback.items():
+                    parsed.setdefault(key, value)
+                if parsed.get("action") not in {"create_incident", "update_incident", "ignore"}:
+                    parsed["action"] = fallback["action"]
+                return parsed
+            logger.warning("decide_incident_bundle attempt %d: LLM returned no parseable JSON", _attempt + 1)
+        except Exception as exc:
+            logger.warning("decide_incident_bundle attempt %d failed: %s", _attempt + 1, exc)
+    return fallback
 
 
 def _fallback_bundle_decision(
@@ -601,8 +494,9 @@ def generate_ai_summary(incident: dict[str, Any], logs: list[dict[str, Any]]) ->
                 parsed["suggested_checks"] = list(parsed.get("suggested_checks", []))
                 parsed["raw_response"] = text
                 return parsed
-        except Exception:
-            pass
+            logger.warning("generate_ai_summary: LLM returned no parseable JSON")
+        except Exception as exc:
+            logger.warning("generate_ai_summary failed: %s", exc)
 
     fallback = _fallback_summary(incident)
     fallback["raw_response"] = json.dumps(prompt, ensure_ascii=False)
@@ -612,8 +506,14 @@ def generate_ai_summary(incident: dict[str, Any], logs: list[dict[str, Any]]) ->
 def _execute_tool(tool_map: dict[str, Any], tool_call: dict[str, Any]) -> tuple[str, str]:
     tool_name = tool_call["name"]
     args = tool_call.get("args", {}) or {}
-    result = tool_map[tool_name].invoke(args)
-    return tool_name, result
+    if tool_name not in tool_map:
+        return tool_name, f"[TOOL ERROR] Unknown tool '{tool_name}'."
+    try:
+        result = tool_map[tool_name].invoke(args)
+    except Exception as exc:
+        logger.warning("Tool '%s' raised an exception: %s", tool_name, exc)
+        result = f"[TOOL ERROR] {tool_name} failed: {exc}"
+    return tool_name, str(result)
 
 
 def run_llm_troubleshoot(
@@ -633,14 +533,21 @@ def run_llm_troubleshoot(
     if not device_cache:
         return fallback
 
+    # Prefer matching by management IP, then by hostname, then first in cache
+    primary_ip = incident.get("primary_source_ip", "")
+    primary_hostname = incident.get("primary_hostname", "")
     target_host = next(
-        (
-            record["hostname"]
-            for record in device_cache.values()
-            if record["ip_address"] == incident["primary_source_ip"]
-        ),
-        next(iter(device_cache)),
+        (hostname for hostname, record in device_cache.items() if record.get("ip_address") == primary_ip),
+        None,
     )
+    if target_host is None and primary_hostname and primary_hostname in device_cache:
+        target_host = primary_hostname
+    if target_host is None:
+        target_host = next(iter(device_cache))
+        logger.warning(
+            "run_llm_troubleshoot: no device match for IP=%s hostname=%s, falling back to %s",
+            primary_ip, primary_hostname, target_host,
+        )
     tools = [lookup_device, list_all_devices, create_run_cli_tool(device_cache)]
     tool_map = {tool.name: tool for tool in tools}
 
@@ -674,9 +581,34 @@ def run_llm_troubleshoot(
                             "   Try a different related command rather than repeating the same one. "
                             "Prefer lightweight commands such as 'show interface Tunnel10', 'show ip bgp summary', "
                             "'show ip ospf neighbor', 'show ip eigrp neighbors', 'show track', 'show ip route'. "
+                            "\n"
+                            "DISPOSITION DECISION RULES — apply these BEFORE defaulting to needs_human_review:\n"
+                            "Rule 1 — ADMINISTRATIVELY DOWN = config_fix_possible:\n"
+                            "  If 'show interface' output contains '<intf> is administratively down', the interface was manually shut down by a human.\n"
+                            "  This is ALWAYS config_fix_possible. The fix is exactly: ['interface <intf>', 'no shutdown'].\n"
+                            "  rollback_commands: ['interface <intf>', 'shutdown'].\n"
+                            "  verification_commands: ['show interface <intf>'] plus the relevant protocol neighbor command.\n"
+                            "  Do NOT return needs_human_review when you see 'administratively down' — the cause is unambiguous.\n"
+                            "Rule 2 — PROTOCOL NEIGHBOR TIMEOUT = monitor_further or config_fix_possible:\n"
+                            "  If OSPF/BGP/EIGRP neighbor is missing and the interface is up/up (not admin-down), run 'show ip ospf neighbor' / 'show ip bgp summary'.\n"
+                            "  If interface is up and neighbor count is 0, check timers — return monitor_further unless a clear config issue is found.\n"
+                            "Rule 3 — INTERFACE PHYSICALLY DOWN = physical_issue or needs_human_review:\n"
+                            "  If 'show interface' output contains '<intf> is down, line protocol is down' without 'administratively', this may be physical. Return physical_issue.\n"
+                            "Rule 4 — SELF-RECOVERED:\n"
+                            "  If syslog shows a 'down' event followed by 'up' and the current CLI output shows the interface/neighbor is up, return self_recovered.\n"
+                            "Rule 5 — ONLY use needs_human_review when evidence is truly ambiguous — CLI output is inconsistent, multiple conflicting signals, or you cannot determine root cause.\n"
+                            "\n"
                             "When you are done, return strict JSON with keys: disposition, summary, "
                             "conclusion, proposed_fix_title, proposed_fix_rationale, proposed_commands, "
-                            "rollback_plan, expected_impact, verification_commands. "
+                            "rollback_commands, rollback_plan, expected_impact, verification_commands. "
+                            "proposed_commands: ordered list of IOS config-mode command strings that Netmiko will send via send_config_set() — "
+                            "do NOT include 'configure terminal' or 'end' (Netmiko adds those automatically). "
+                            "Each command must be fully self-contained: if a command is interface-specific, always include the navigation "
+                            "line first, e.g. ['interface GigabitEthernet0/2', 'no shutdown']. "
+                            "For routing changes include the correct config context: ['router ospf 10', 'network 10.0.0.0 0.0.0.255 area 0']. "
+                            "rollback_commands: ordered list with the same navigation rules, performing the exact inverse of proposed_commands. "
+                            "rollback_plan: plain-text description of what the rollback does and when to trigger it. "
+                            "verification_commands: list of IOS exec-mode show commands (NOT config-mode) to confirm the fix worked. "
                             "The summary must read like a senior engineer status note. "
                             "The conclusion must read like a senior engineer judgment that clearly states whether to monitor, escalate, or propose remediation. "
                             "If the evidence points to physical or provider fault, say so directly and avoid configuration suggestions. "
@@ -689,7 +621,7 @@ def run_llm_troubleshoot(
                 ]
                 steps: list[dict[str, Any]] = []
                 final_text = ""
-                for _ in range(5):
+                for iteration in range(5):
                     reply = model.invoke(messages)
                     messages.append(reply)
                     tool_calls = getattr(reply, "tool_calls", None) or []
@@ -704,6 +636,16 @@ def run_llm_troubleshoot(
                             "content": result,
                         })
                         messages.append(ToolMessage(content=result, tool_call_id=tool_call["id"], name=tool_name))
+                else:
+                    # Max iterations reached — ask LLM for final JSON summary without tools
+                    logger.warning("run_llm_troubleshoot: max iterations reached for %s, requesting final answer", incident.get("incident_no"))
+                    messages.append(HumanMessage(content=(
+                        "You have used the maximum number of tool calls. "
+                        "Based on all evidence gathered so far, provide your final assessment as strict JSON now. "
+                        "Do not call any more tools."
+                    )))
+                    nudge_reply = model.invoke(messages)
+                    final_text = str(getattr(nudge_reply, "content", "") or "")
 
             data = _safe_json(final_text, {})
             if not data:
@@ -717,6 +659,7 @@ def run_llm_troubleshoot(
                     "title": data.get("proposed_fix_title") or f"Proposed fix for {incident['incident_no']}",
                     "rationale": data.get("proposed_fix_rationale") or "LLM-generated remediation proposal.",
                     "commands": list(data.get("proposed_commands") or []),
+                    "rollback_commands": list(data.get("rollback_commands") or []),
                     "rollback_plan": data.get("rollback_plan") or "Rollback the change if verification fails.",
                     "expected_impact": data.get("expected_impact") or "Should restore the affected logical state.",
                     "verification_commands": list(data.get("verification_commands") or []),
@@ -733,6 +676,7 @@ def run_llm_troubleshoot(
                 "raw_response": final_text,
             }, incident)
         except Exception as exc:
+            logger.warning("run_llm_troubleshoot failed for incident %s: %s", incident.get("incident_no"), exc)
             fallback["summary"] = f"Investigation fell back after an LLM/tooling error: {exc}"
             return fallback
     return _rewrite_troubleshoot_result(fallback, incident)

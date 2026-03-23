@@ -3,124 +3,719 @@
 import Link from "next/link";
 import { useState, useTransition, useEffect, useCallback } from "react";
 import {
-  CheckCircle2, ClipboardCheck, Copy, Loader2, PlayCircle, RefreshCw,
-  ShieldAlert, Terminal, Wrench, Clock, Server, FileText, ListTree,
+  Activity, AlertTriangle, CheckCircle2, ChevronDown, ChevronRight,
+  ChevronUp, Clock, Copy, Eye, FileSearch, Loader2, Play, RotateCcw,
+  Server, ShieldAlert, Terminal, Wifi, Wrench, XCircle, Zap,
 } from "lucide-react";
-import type { AIOpsIncidentDetailPayload } from "@/lib/aiops-types";
-import { approveProposal, executeProposal, fetchIncidentDetail, runTroubleshoot, submitRecoveryDecision } from "@/lib/aiops-api";
-import { SectionCard } from "@/components/aiops/section-card";
+import type { AIOpsIncidentDetailPayload, AIOpsTimelineEntry } from "@/lib/aiops-types";
+import {
+  approveProposal, executeProposal, fetchIncidentDetail,
+  runTroubleshoot, submitRecoveryDecision,
+} from "@/lib/aiops-api";
 import { StatusBadge } from "@/components/aiops/status-badge";
 
 const POLL_INTERVAL = 15_000;
 
-type Tab = "overview" | "investigation" | "evidence" | "timeline";
-
-const TABS: { id: Tab; label: string; icon: React.ElementType }[] = [
-  { id: "overview",      label: "Overview",      icon: Server },
-  { id: "investigation", label: "Investigation",  icon: Wrench },
-  { id: "evidence",      label: "Evidence",       icon: FileText },
-  { id: "timeline",      label: "Timeline",       icon: ListTree },
-];
-
-const SEV_BANNER: Record<string, string> = {
-  critical: "border-l-rose-500   bg-rose-500/5",
-  warning:  "border-l-amber-500  bg-amber-500/5",
-  info:     "border-l-sky-500/60 bg-sky-500/5",
-};
+/* ─────────────────── Utilities ─────────────────── */
 
 function relativeTime(iso: string) {
   const diff = Date.now() - new Date(iso).getTime();
-  const mins = Math.floor(diff / 60_000);
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  return `${Math.floor(hrs / 24)}d ago`;
+  const m = Math.floor(diff / 60_000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
 }
 
-function fmt(v: string | null | undefined) {
-  return v ? new Date(v).toLocaleString() : "—";
+function fmtTime(v: string | null | undefined) {
+  if (!v) return "—";
+  return new Date(v).toLocaleString("en-GB", { dateStyle: "short", timeStyle: "short" });
 }
 
-function ConfidencePill({ score }: { score: number }) {
-  const pct = Math.round(score * 100);
-  const cls = pct >= 80 ? "text-emerald-400 border-emerald-500/30 bg-emerald-500/8"
-            : pct >= 60 ? "text-amber-400  border-amber-500/30  bg-amber-500/8"
-                        : "text-rose-400   border-rose-500/30   bg-rose-500/8";
-  return (
-    <span className={`inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[0.68rem] font-semibold ${cls}`}>
-      {pct}% confidence
-    </span>
-  );
+function dur(from: string, to?: string | null) {
+  const ms = (to ? new Date(to) : new Date()).getTime() - new Date(from).getTime();
+  const m = Math.floor(ms / 60_000);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  return h < 24 ? `${h}h ${m % 60}m` : `${Math.floor(h / 24)}d ${h % 24}h`;
 }
 
-function RiskBadge({ level }: { level: string }) {
-  const cls = level === "high"   ? "border-rose-500/30   bg-rose-500/10   text-rose-300"
-            : level === "medium" ? "border-amber-500/30  bg-amber-500/10  text-amber-300"
-                                 : "border-emerald-500/30 bg-emerald-500/10 text-emerald-300";
-  return (
-    <span className={`inline-flex items-center rounded border px-2 py-0.5 text-[0.67rem] font-semibold uppercase tracking-wide ${cls}`}>
-      Risk: {level}
-    </span>
-  );
-}
+/* ─────────────────── Micro-components ─────────────────── */
 
-function CopyButton({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
-  const copy = async () => {
-    await navigator.clipboard.writeText(text);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
+function CopyBtn({ text }: { text: string }) {
+  const [ok, setOk] = useState(false);
   return (
     <button
-      onClick={copy}
-      className="inline-flex items-center gap-1 rounded border border-white/8 bg-white/[0.04] px-2 py-0.5 text-[0.67rem] text-slate-500 transition hover:bg-white/[0.08] hover:text-slate-200"
+      onClick={async () => { await navigator.clipboard.writeText(text); setOk(true); setTimeout(() => setOk(false), 1500); }}
+      title="Copy"
+      className="rounded px-1.5 py-0.5 text-[0.65rem] text-slate-700 transition hover:bg-white/[0.06] hover:text-slate-300"
     >
-      {copied ? <ClipboardCheck className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
-      {copied ? "Copied" : "Copy"}
+      {ok ? "✓" : <Copy className="h-3 w-3" />}
     </button>
   );
 }
 
-function StatRow({ label, value }: { label: string; value: React.ReactNode }) {
+function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
-    <div className="flex items-center justify-between gap-3 py-2 text-[0.8rem]">
-      <span className="text-slate-500">{label}</span>
-      <span className="font-medium text-slate-200">{value ?? "—"}</span>
+    <p className="mb-2 text-[0.65rem] font-bold uppercase tracking-[0.14em] text-slate-600">{children}</p>
+  );
+}
+
+function Divider() {
+  return <div className="border-t border-white/[0.06]" />;
+}
+
+/* ─────────────────── Terminal / code blocks ─────────────────── */
+
+function TermBlock({ title, lines, color = "text-slate-200" }: { title: string; lines: string[]; color?: string }) {
+  if (!lines.length) return null;
+  return (
+    <div className="overflow-hidden rounded border border-white/[0.07] bg-[#080c16]">
+      <div className="flex items-center justify-between bg-white/[0.025] px-3 py-1.5">
+        <span className="flex items-center gap-1.5 text-[0.65rem] font-semibold uppercase tracking-widest text-slate-600">
+          <Terminal className="h-3 w-3" />{title}
+        </span>
+        <CopyBtn text={lines.join("\n")} />
+      </div>
+      <div className={`px-3 py-2.5 font-mono text-[0.78rem] leading-[1.75] ${color}`}>
+        {lines.map((l, i) => (
+          <div key={i} className="flex gap-2">
+            <span className="select-none text-slate-700">$</span>
+            <span>{l}</span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
 
-function CodeBlock({ title, content, color = "text-slate-300" }: { title: string; content: string; color?: string }) {
+function OutputBlock({ title, content }: { title: string; content: string }) {
+  const [exp, setExp] = useState(false);
+  const lines = content.trim().split("\n");
   return (
-    <div className="rounded border border-white/8 bg-[#060b14]">
-      <div className="flex items-center justify-between border-b border-white/[0.06] px-3 py-2">
-        <div className="flex items-center gap-2">
-          <Terminal className="h-3 w-3 text-slate-600" />
-          <span className="text-[0.68rem] font-semibold uppercase tracking-widest text-slate-600">{title}</span>
-        </div>
-        <CopyButton text={content} />
+    <div className="overflow-hidden rounded border border-white/[0.06] bg-[#060a12]">
+      <div className="flex items-center justify-between bg-white/[0.015] px-3 py-1.5">
+        <span className="text-[0.63rem] font-medium uppercase tracking-widest text-slate-700">{title}</span>
+        <CopyBtn text={content} />
       </div>
-      <pre className={`max-h-48 overflow-auto p-3 text-[0.76rem] leading-6 ${color}`}>
-        {content}
+      <pre className="overflow-x-auto px-3 py-2.5 font-mono text-[0.74rem] leading-[1.65] text-slate-400 whitespace-pre-wrap">
+        {exp ? content.trim() : lines.slice(0, 7).join("\n")}
+        {!exp && lines.length > 7 && <span className="text-slate-700">{"\n…"}</span>}
       </pre>
+      {lines.length > 7 && (
+        <button onClick={() => setExp(v => !v)}
+          className="flex w-full items-center justify-center gap-1 border-t border-white/[0.05] py-1.5 text-[0.65rem] text-slate-700 hover:text-slate-400">
+          {exp ? <><ChevronUp className="h-3 w-3" />collapse</> : <><ChevronDown className="h-3 w-3" />{lines.length - 7} more lines</>}
+        </button>
+      )}
     </div>
   );
 }
+
+/* ─────────────────── Disposition banner ─────────────────── */
+
+const DISP: Record<string, { icon: React.ElementType; color: string; bg: string; border: string; label: string; sub: string }> = {
+  config_fix_possible:  { icon: CheckCircle2,  color: "text-emerald-300", bg: "bg-emerald-500/[0.07]", border: "border-emerald-500/25", label: "Config Fix Identified",   sub: "AI found a config-level root cause and generated a remediation plan." },
+  physical_issue:       { icon: AlertTriangle, color: "text-orange-300",  bg: "bg-orange-500/[0.07]",  border: "border-orange-500/25",  label: "Physical / Hardware",      sub: "Cannot be fixed via config push. On-site inspection or hardware replacement required." },
+  external_issue:       { icon: Wifi,          color: "text-rose-300",    bg: "bg-rose-500/[0.07]",    border: "border-rose-500/25",    label: "External / Provider",      sub: "Root cause is outside this device. Contact upstream provider or circuit owner." },
+  self_recovered:       { icon: CheckCircle2,  color: "text-sky-300",     bg: "bg-sky-500/[0.07]",     border: "border-sky-500/25",     label: "Self-Recovered",           sub: "Network healed on its own. Verify stability before closing." },
+  monitor_further:      { icon: Activity,      color: "text-amber-300",   bg: "bg-amber-500/[0.07]",   border: "border-amber-500/25",   label: "Monitor Further",          sub: "Insufficient evidence to act now. Continue observing." },
+  needs_human_review:   { icon: ShieldAlert,   color: "text-fuchsia-300", bg: "bg-fuchsia-500/[0.07]", border: "border-fuchsia-500/25", label: "Needs Human Review",       sub: "AI confidence too low. Manual inspection required." },
+};
+
+function DispositionBanner({ disposition, summary }: { disposition: string; summary?: string }) {
+  const d = DISP[disposition] ?? { icon: FileSearch, color: "text-slate-300", bg: "bg-white/[0.03]", border: "border-white/10", label: disposition.replaceAll("_", " "), sub: "" };
+  const Icon = d.icon;
+  return (
+    <div className={`flex items-start gap-3 rounded-lg border px-4 py-3.5 ${d.bg} ${d.border}`}>
+      <Icon className={`mt-0.5 h-5 w-5 shrink-0 ${d.color}`} />
+      <div className="min-w-0">
+        <p className={`text-[0.9rem] font-bold ${d.color}`}>{d.label}</p>
+        <p className="mt-0.5 text-[0.78rem] text-slate-500">{summary || d.sub}</p>
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────── What to do next ─────────────────── */
+
+type Step = { num: number; action: string; detail?: string; type?: "primary" | "caution" | "info" };
+
+const RECS: Record<string, Step[]> = {
+  verifying: [
+    { num: 1, action: "Review the execution output in the Remediation Plan below",                    detail: "Confirm the config was applied and verification commands returned expected output.",         type: "primary" },
+    { num: 2, action: "Confirm service is restored — check device or watch syslog",                  detail: "Look for: FULL state / Interface up / Established / Cleared in the logs.",                type: "primary" },
+    { num: 3, action: "Click 'Mark Recovered' below to close this incident",                         detail: "This records resolution time (MTTR) and closes the incident.",                            type: "primary" },
+    { num: 4, action: "If still broken → click 'Mark Still Broken' to re-investigate",              detail: "Incident returns to active state and AI can re-run troubleshoot with new evidence.",       type: "caution" },
+  ],
+  config_fix_possible: [
+    { num: 1, action: "Review the remediation commands in the section below",           detail: "Confirm interface name, device hostname, and change window before proceeding.", type: "primary" },
+    { num: 2, action: "Approve the proposal",                                           detail: "Your name and timestamp will be recorded as the change authoriser.",            type: "primary" },
+    { num: 3, action: "Execute — Netmiko will SSH and apply the config",               detail: "Verification commands run automatically after execution.",                       type: "primary" },
+    { num: 4, action: "Confirm adjacency is restored via syslog or mark recovered",    detail: "Look for: %OSPF-5-ADJCHG…FULL / Interface up.",                                 type: "info"    },
+  ],
+  physical_issue: [
+    { num: 1, action: "Check physical layer on the reported interface",                 detail: "Verify cable seating, SFP, and link LEDs on both sides of the link.",           type: "caution" },
+    { num: 2, action: "Check error counters: show interface <iface>",                  detail: "Look for input errors, CRC, giants, runts — indicates physical layer problem.", type: "primary" },
+    { num: 3, action: "Inspect far-end device port status",                            detail: "Confirm the connected port is up/up.",                                           type: "primary" },
+    { num: 4, action: "Escalate to NOC / field team if hardware swap is needed",       detail: "Document findings and update incident timeline before escalating.",             type: "caution" },
+  ],
+  external_issue: [
+    { num: 1, action: "Contact upstream provider / circuit owner",                     detail: "Reference circuit ID and report the fault start time.",                         type: "caution" },
+    { num: 2, action: "Verify alternate path: show ip route / show bgp summary",      detail: "Confirm if traffic is rerouted via backup path.",                               type: "primary" },
+    { num: 3, action: "Monitor until provider confirms restoration",                   detail: "Log all provider updates in the incident timeline.",                            type: "info"    },
+  ],
+  monitor_further: [
+    { num: 1, action: "Manually verify current state on the device",                   detail: "Run: show ip ospf neighbor / show ip bgp summary / show interface.",           type: "primary" },
+    { num: 2, action: "Re-run AI Troubleshoot after 5–10 min for more data",          detail: "Additional syslog events may have arrived since the last run.",                 type: "info"    },
+    { num: 3, action: "Watch syslog for recurrence or recovery signals",               detail: "Look for: ADJCHG…FULL, Interface up, Established, Cleared.",                  type: "info"    },
+  ],
+  self_recovered: [
+    { num: 1, action: "Verify adjacency is stable: show ip ospf neighbor",             detail: "Confirm state is FULL and has been stable for > 5 minutes.",                   type: "primary" },
+    { num: 2, action: "Check for flapping — if recurred > 3× in 1 hour, investigate", detail: "Flapping indicates an underlying instability (timer mismatch, link quality).", type: "caution" },
+    { num: 3, action: "Mark recovered if stable — or let auto-resolve handle it",     detail: "Incident will auto-close after stability window.",                              type: "info"    },
+  ],
+  needs_human_review: [
+    { num: 1, action: "Check Investigation section for partial CLI evidence",          detail: "AI could not reach a confident conclusion — review raw output manually.",      type: "caution" },
+    { num: 2, action: "SSH into the device and inspect manually",                      detail: "Use the device and interface from the correlation key as starting point.",     type: "primary" },
+    { num: 3, action: "Re-run AI Troubleshoot — newer logs may yield more",           detail: "More syslog events may have arrived and changed the picture.",                  type: "info"    },
+  ],
+};
+
+function WhatToDoNext({ data }: { data: AIOpsIncidentDetailPayload }) {
+  const { troubleshoot, ai_summary, incident } = data;
+  if (["resolved", "closed"].includes(incident.status)) return null;
+
+  let steps: Step[] = [];
+  let label = "What to do next";
+  let sub = "";
+
+  // Verifying state always takes precedence regardless of troubleshoot disposition
+  if (incident.status === "verifying") {
+    steps = RECS.verifying;
+    label = "Verify & Close";
+    sub = "Remediation executed — confirm recovery to close incident";
+  } else if (troubleshoot) {
+    steps = RECS[troubleshoot.disposition] ?? [];
+    sub = `Based on AI investigation · ${troubleshoot.disposition.replaceAll("_", " ")}`;
+  } else if (ai_summary?.suggested_checks?.length) {
+    steps = ai_summary.suggested_checks.map((s, i) => ({ num: i + 1, action: s, type: "info" as const }));
+    label = "Suggested Checks";
+    sub = "Initial triage from syslog text · Run AI Troubleshoot for SSH-verified diagnosis";
+  } else {
+    steps = [{ num: 1, action: "Run AI Troubleshoot to SSH into the device and get a verified diagnosis", detail: "Click the button in the action bar above.", type: "primary" }];
+  }
+
+  if (!steps.length) return null;
+
+  return (
+    <div className="overflow-hidden rounded-lg border border-white/[0.07] bg-[#0c1220]">
+      <div className="flex items-center justify-between border-b border-white/[0.07] px-4 py-3">
+        <div className="flex items-center gap-2">
+          <Zap className="h-3.5 w-3.5 text-amber-400/80" />
+          <span className="text-[0.82rem] font-semibold text-white">{label}</span>
+        </div>
+        {sub && <span className="text-[0.65rem] text-slate-600">{sub}</span>}
+      </div>
+      <div className="divide-y divide-white/[0.05]">
+        {steps.map((s) => {
+          const lc = s.type === "primary" ? "border-l-cyan-500/50"  : s.type === "caution" ? "border-l-amber-500/50" : "border-l-white/[0.07]";
+          const nc = s.type === "primary" ? "bg-cyan-500/15 text-cyan-300" : s.type === "caution" ? "bg-amber-500/15 text-amber-400" : "bg-white/[0.04] text-slate-500";
+          return (
+            <div key={s.num} className={`flex gap-3 border-l-[3px] px-4 py-3 ${lc}`}>
+              <span className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[0.63rem] font-bold ${nc}`}>{s.num}</span>
+              <div>
+                <p className="text-[0.82rem] font-medium text-slate-100">{s.action}</p>
+                {s.detail && <p className="mt-0.5 text-[0.73rem] leading-5 text-slate-500">{s.detail}</p>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────── Remediation plan ─────────────────── */
+
+function RemediationPlan({ data, withAction, actionLoading }: {
+  data: AIOpsIncidentDetailPayload;
+  withAction: (n: string, fn: () => Promise<AIOpsIncidentDetailPayload>) => void;
+  actionLoading: string | null;
+}) {
+  const { proposal, execution } = data;
+  if (!proposal) return null;
+
+  const isPending  = proposal.status === "pending";
+  const isApproved = proposal.status === "approved" && !execution;
+  const isDone     = !isPending && !isApproved;
+  const isBusy     = !!actionLoading;
+  const incNo      = data.incident.incident_no;
+
+  const riskCls = proposal.risk_level === "high"
+    ? "text-rose-300 border-rose-500/30 bg-rose-500/10"
+    : proposal.risk_level === "medium"
+    ? "text-amber-300 border-amber-500/30 bg-amber-500/10"
+    : "text-emerald-300 border-emerald-500/30 bg-emerald-500/10";
+
+  return (
+    <div id="remediation" className="overflow-hidden rounded-lg border border-white/[0.07] bg-[#0c1220]">
+      {/* Header */}
+      <div className="flex items-center justify-between border-b border-white/[0.07] px-4 py-3">
+        <div className="flex items-center gap-2">
+          <ShieldAlert className={`h-3.5 w-3.5 ${isDone ? "text-slate-600" : "text-fuchsia-400"}`} />
+          <span className="text-[0.82rem] font-semibold text-white">Remediation Plan</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className={`rounded border px-1.5 py-0.5 text-[0.62rem] font-bold uppercase tracking-wide ${riskCls}`}>{proposal.risk_level} risk</span>
+          <StatusBadge value={proposal.status} />
+        </div>
+      </div>
+
+      <div className="space-y-4 p-4">
+        {/* Title + rationale */}
+        <div>
+          <p className="text-[0.88rem] font-semibold text-slate-100">{proposal.title}</p>
+          <p className="mt-1 text-[0.79rem] leading-6 text-slate-400">{proposal.rationale}</p>
+          {proposal.target_devices?.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {proposal.target_devices.map(d => (
+                <span key={d} className="rounded border border-cyan-500/20 bg-cyan-500/[0.06] px-2 py-0.5 font-mono text-[0.73rem] text-cyan-300">
+                  <Server className="mr-1 inline h-3 w-3 opacity-60" />{d}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <Divider />
+
+        {/* Commands grid */}
+        <div className="grid gap-3 sm:grid-cols-2">
+          {proposal.commands?.length > 0 && (
+            <TermBlock title="Apply" lines={proposal.commands} color="text-cyan-300" />
+          )}
+          {proposal.verification_commands?.length > 0 && (
+            <TermBlock title="Verify after" lines={proposal.verification_commands} color="text-emerald-300" />
+          )}
+        </div>
+
+        {/* Rollback */}
+        {proposal.rollback_plan && (
+          <div className="flex gap-2 rounded border border-amber-500/15 bg-amber-500/[0.04] px-3 py-2.5">
+            <RotateCcw className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500/60" />
+            <div>
+              <p className="text-[0.65rem] font-semibold uppercase tracking-widest text-amber-600">Rollback plan</p>
+              <p className="mt-0.5 text-[0.77rem] leading-5 text-amber-300/80">{proposal.rollback_plan}</p>
+            </div>
+          </div>
+        )}
+
+        {/* Execution result */}
+        {execution && (
+          <>
+            <Divider />
+            <div className={`rounded border p-3 ${execution.status === "completed" ? "border-emerald-500/20 bg-emerald-500/[0.04]" : "border-rose-500/20 bg-rose-500/[0.04]"}`}>
+              <div className="mb-2 flex items-center gap-2">
+                {execution.status === "completed" ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" /> : <XCircle className="h-3.5 w-3.5 text-rose-400" />}
+                <span className={`text-[0.8rem] font-semibold ${execution.status === "completed" ? "text-emerald-300" : "text-rose-300"}`}>
+                  Execution {execution.status === "completed" ? "completed" : "failed"}
+                </span>
+                {execution.completed_at && <span className="ml-auto text-[0.67rem] text-slate-600">{fmtTime(execution.completed_at)}</span>}
+              </div>
+              {execution.output && <OutputBlock title="Device output" content={execution.output} />}
+              {execution.verification_notes && (
+                <div className="mt-2"><OutputBlock title="Verification output" content={execution.verification_notes} /></div>
+              )}
+            </div>
+          </>
+        )}
+
+        {/* Action buttons */}
+        {!isDone && (
+          <>
+            <Divider />
+            <div className="flex items-center gap-3">
+              {isPending && (
+                <button onClick={() => withAction("approve", () => approveProposal(incNo, "lab-operator"))} disabled={isBusy}
+                  className="inline-flex items-center gap-2 rounded border border-fuchsia-500/30 bg-fuchsia-500/10 px-4 py-2 text-[0.82rem] font-semibold text-fuchsia-300 transition hover:bg-fuchsia-500/20 disabled:opacity-40">
+                  {actionLoading === "approve" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldAlert className="h-3.5 w-3.5" />}
+                  {actionLoading === "approve" ? "Approving…" : "Approve"}
+                </button>
+              )}
+              {isApproved && (
+                <button onClick={() => withAction("execute", () => executeProposal(incNo, "lab-operator"))} disabled={isBusy}
+                  className="inline-flex items-center gap-2 rounded border border-emerald-500/30 bg-emerald-500/10 px-4 py-2 text-[0.82rem] font-semibold text-emerald-300 transition hover:bg-emerald-500/20 disabled:opacity-40">
+                  {actionLoading === "execute" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+                  {actionLoading === "execute" ? "Executing on device…" : "Execute Now"}
+                </button>
+              )}
+              {actionLoading === "execute" && (
+                <span className="text-[0.75rem] text-slate-500 animate-pulse">SSH → applying config…</span>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────── Investigation evidence ─────────────────── */
+
+function CliStep({ step, index }: { step: { tool_name: string; args: Record<string, unknown>; content: string }; index: number }) {
+  const [open, setOpen] = useState(index === 0);
+  const cmd = (step.args?.command as string) ?? (step.args?.hostname as string) ?? step.tool_name;
+  return (
+    <div className="overflow-hidden rounded border border-white/[0.07] bg-[#080c16]">
+      <div role="button" tabIndex={0} onClick={() => setOpen(v => !v)} onKeyDown={e => e.key === "Enter" && setOpen(v => !v)}
+        className="flex w-full cursor-pointer items-center gap-3 px-3 py-2.5 text-left hover:bg-white/[0.02]">
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded bg-white/[0.06] font-mono text-[0.62rem] font-bold text-slate-500">{index + 1}</span>
+        <Terminal className="h-3.5 w-3.5 shrink-0 text-slate-700" />
+        <code className="flex-1 truncate font-mono text-[0.8rem] text-cyan-300">{cmd}</code>
+        <CopyBtn text={step.content} />
+        {open ? <ChevronUp className="h-3.5 w-3.5 text-slate-700" /> : <ChevronRight className="h-3.5 w-3.5 text-slate-700" />}
+      </div>
+      {open && step.content && (
+        <div className="border-t border-white/[0.05]">
+          <pre className="max-h-52 overflow-auto px-4 py-3 font-mono text-[0.74rem] leading-[1.65] text-slate-300 whitespace-pre">{step.content}</pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function InvestigationSection({ data, loading }: { data: AIOpsIncidentDetailPayload; loading?: boolean }) {
+  const { troubleshoot, ai_summary } = data;
+
+  /* ── Loading state ── */
+  if (loading) {
+    return (
+      <div id="investigation" className="overflow-hidden rounded-lg border border-white/[0.07] bg-[#0c1220]">
+        <div className="border-b border-white/[0.07] px-4 py-3 flex items-center gap-2">
+          <Loader2 className="h-3.5 w-3.5 animate-spin text-cyan-500" />
+          <span className="text-[0.82rem] font-semibold text-white">AI Investigation</span>
+          <span className="ml-1.5 text-[0.72rem] text-slate-500 animate-pulse">SSHing into device, running diagnostics…</span>
+        </div>
+        <div className="space-y-3 p-4">
+          {[80, 60, 72].map((w, i) => (
+            <div key={i} className="h-3 rounded bg-white/[0.04] animate-pulse" style={{ width: `${w}%` }} />
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  /* ── No troubleshoot yet — show ai_summary as initial analysis ── */
+  if (!troubleshoot) {
+    if (!ai_summary) return null;
+    const pct = Math.round((ai_summary.confidence_score ?? 0) * 100);
+    return (
+      <div id="investigation" className="overflow-hidden rounded-lg border border-amber-500/15 bg-[#0c1220]">
+        <div className="border-b border-white/[0.07] px-4 py-3 flex items-center gap-2">
+          <FileSearch className="h-3.5 w-3.5 text-amber-400/70" />
+          <span className="text-[0.82rem] font-semibold text-white">Initial Analysis</span>
+          <span className="ml-1.5 rounded bg-amber-500/10 px-1.5 py-0.5 text-[0.62rem] font-semibold text-amber-400/80">
+            Log-based · SSH not yet run
+          </span>
+        </div>
+        <div className="space-y-4 p-4">
+          <div className="space-y-1.5">
+            <SectionLabel>Summary</SectionLabel>
+            <p className="text-[0.84rem] font-medium leading-7 text-slate-100">{ai_summary.summary}</p>
+          </div>
+          {ai_summary.probable_cause && (
+            <>
+              <Divider />
+              <div className="space-y-1.5">
+                <SectionLabel>Probable Cause</SectionLabel>
+                <p className="text-[0.81rem] leading-7 text-slate-300">{ai_summary.probable_cause}</p>
+              </div>
+            </>
+          )}
+          {ai_summary.impact && (
+            <>
+              <Divider />
+              <div className="flex items-center justify-between">
+                <div className="space-y-0.5">
+                  <SectionLabel>Impact</SectionLabel>
+                  <p className="text-[0.8rem] text-slate-400">{ai_summary.impact}</p>
+                </div>
+                <div className="text-right">
+                  <p className="text-[0.63rem] text-slate-600 uppercase tracking-widest">Confidence</p>
+                  <p className={`text-[0.9rem] font-bold ${pct >= 70 ? "text-emerald-400" : pct >= 50 ? "text-amber-400" : "text-rose-400"}`}>{pct}%</p>
+                </div>
+              </div>
+            </>
+          )}
+          <Divider />
+          <p className="flex items-center gap-1.5 text-[0.72rem] text-amber-500/70">
+            <AlertTriangle className="h-3 w-3 shrink-0" />
+            This analysis is based on syslog text only. Run AI Troubleshoot above to get SSH-verified diagnosis with higher confidence.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  const steps = troubleshoot.steps ?? [];
+
+  return (
+    <div id="investigation" className="overflow-hidden rounded-lg border border-white/[0.07] bg-[#0c1220]">
+      <div className="border-b border-white/[0.07] px-4 py-3">
+        <div className="flex items-center gap-2">
+          <Wrench className="h-3.5 w-3.5 text-slate-600" />
+          <span className="text-[0.82rem] font-semibold text-white">AI Investigation</span>
+          <span className="ml-1.5 rounded bg-cyan-500/10 px-1.5 py-0.5 text-[0.62rem] font-semibold text-cyan-400">
+            {steps.length} CLI command{steps.length !== 1 ? "s" : ""}
+          </span>
+        </div>
+      </div>
+
+      <div className="space-y-4 p-4">
+        {/* ai_summary always shown first — log-based context */}
+        {ai_summary && (
+          <>
+            <div className="space-y-1.5">
+              <SectionLabel>Incident Summary</SectionLabel>
+              <p className="text-[0.84rem] font-medium leading-7 text-slate-100">{ai_summary.summary}</p>
+              {ai_summary.probable_cause && (
+                <p className="mt-1 text-[0.78rem] leading-6 text-slate-400">
+                  <span className="font-semibold text-slate-500">Probable cause:</span> {ai_summary.probable_cause}
+                </p>
+              )}
+            </div>
+            <Divider />
+          </>
+        )}
+
+        {/* SSH investigation result */}
+        <div className="space-y-1.5">
+          <SectionLabel>SSH Investigation</SectionLabel>
+          <p className="text-[0.82rem] leading-7 text-slate-400">{troubleshoot.summary}</p>
+        </div>
+
+        {troubleshoot.conclusion && (
+          <>
+            <Divider />
+            <div className="space-y-1.5">
+              <SectionLabel>Conclusion</SectionLabel>
+              <p className="text-[0.81rem] leading-7 text-slate-300">{troubleshoot.conclusion}</p>
+            </div>
+          </>
+        )}
+
+        {/* CLI steps */}
+        {steps.length > 0 && (
+          <>
+            <Divider />
+            <div>
+              <SectionLabel>CLI Evidence ({steps.length} steps)</SectionLabel>
+              <div className="space-y-1.5">
+                {steps.map((s, i) => <CliStep key={i} step={s} index={i} />)}
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────── Syslog evidence ─────────────────── */
+
+function SyslogSection({ data }: { data: AIOpsIncidentDetailPayload }) {
+  const [showAll, setShowAll] = useState(false);
+  const logs = data.raw_logs;
+  if (!logs.length) return null;
+  const visible = showAll ? logs : logs.slice(0, 3);
+
+  return (
+    <div id="evidence" className="overflow-hidden rounded-lg border border-white/[0.07] bg-[#0c1220]">
+      <div className="flex items-center justify-between border-b border-white/[0.07] px-4 py-3">
+        <div className="flex items-center gap-2">
+          <Terminal className="h-3.5 w-3.5 text-slate-600" />
+          <span className="text-[0.82rem] font-semibold text-white">Syslog Evidence</span>
+          <span className="rounded bg-white/[0.05] px-1.5 py-0.5 text-[0.62rem] font-semibold text-slate-500">{logs.length}</span>
+        </div>
+        <Link href={`/aiops/logs?incident=${data.incident.incident_no}`}
+          className="text-[0.7rem] text-slate-600 hover:text-cyan-400">
+          View all →
+        </Link>
+      </div>
+
+      <div className="divide-y divide-white/[0.05]">
+        {visible.map(log => (
+          <div key={log.id} className="px-4 py-3">
+            <div className="mb-1.5 flex items-center gap-2 text-[0.63rem] text-slate-700">
+              <span className="font-mono">{log.source_ip}</span>
+              <span>·</span>
+              <span>{fmtTime(log.event_time)}</span>
+              <span className="ml-auto rounded border border-white/[0.06] px-1 py-0.5">{log.parse_status}</span>
+            </div>
+            <pre className="whitespace-pre-wrap font-mono text-[0.76rem] leading-6 text-slate-300">{log.raw_message}</pre>
+          </div>
+        ))}
+      </div>
+
+      {logs.length > 3 && (
+        <button onClick={() => setShowAll(v => !v)}
+          className="flex w-full items-center justify-center gap-1 border-t border-white/[0.05] py-2.5 text-[0.72rem] text-slate-600 hover:text-slate-400">
+          {showAll ? <><ChevronUp className="h-3.5 w-3.5" />Show less</> : <><ChevronDown className="h-3.5 w-3.5" />{logs.length - 3} more logs</>}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/* ─────────────────── Timeline ─────────────────── */
+
+const TL_ICONS: Record<string, React.ElementType> = {
+  event: Activity, decision: FileSearch, summary: FileSearch,
+  troubleshoot: Wrench, proposal: ShieldAlert, approval: CheckCircle2,
+  execution: Play, recovery: CheckCircle2,
+};
+
+function TimelineSection({ entries }: { entries: AIOpsTimelineEntry[] }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!entries.length) return null;
+  const visible = expanded ? entries : entries.slice(0, 5);
+
+  return (
+    <div id="timeline" className="overflow-hidden rounded-lg border border-white/[0.07] bg-[#0c1220]">
+      <div className="flex items-center justify-between border-b border-white/[0.07] px-4 py-3">
+        <div className="flex items-center gap-2">
+          <Clock className="h-3.5 w-3.5 text-slate-600" />
+          <span className="text-[0.82rem] font-semibold text-white">Incident Timeline</span>
+          <span className="rounded bg-white/[0.05] px-1.5 py-0.5 text-[0.62rem] font-semibold text-slate-500">{entries.length}</span>
+        </div>
+      </div>
+
+      <div className="relative">
+        <div className="absolute bottom-0 left-[1.85rem] top-4 w-px bg-white/[0.05]" />
+        <div className="divide-y divide-white/[0.04]">
+          {visible.map((e) => {
+            const Icon = TL_ICONS[e.kind] ?? Activity;
+            return (
+              <div key={e.id} className="flex gap-3 px-4 py-3">
+                <div className="relative z-10 mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-[#0c1220] ring-1 ring-white/[0.07]">
+                  <Icon className="h-3 w-3 text-slate-600" />
+                </div>
+                <div className="min-w-0 flex-1 pt-0.5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <StatusBadge value={e.kind} />
+                    <span className="text-[0.81rem] font-semibold text-slate-200">{e.title}</span>
+                    <span className="ml-auto shrink-0 text-[0.65rem] text-slate-600">{fmtTime(e.created_at)}</span>
+                  </div>
+                  {e.body && <p className="mt-0.5 text-[0.76rem] leading-5 text-slate-500">{e.body}</p>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {entries.length > 5 && (
+        <button onClick={() => setExpanded(v => !v)}
+          className="flex w-full items-center justify-center gap-1 border-t border-white/[0.05] py-2.5 text-[0.72rem] text-slate-600 hover:text-slate-400">
+          {expanded ? <><ChevronUp className="h-3.5 w-3.5" />Show less</> : <><ChevronDown className="h-3.5 w-3.5" />{entries.length - 5} earlier events</>}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/* ─────────────────── Sidebar ─────────────────── */
+
+function Sidebar({ data }: { data: AIOpsIncidentDetailPayload }) {
+  const { incident, troubleshoot } = data;
+  const parts = incident.correlation_key?.split("|") ?? [];
+  const iface    = parts[2] ?? null;
+  const neighbor = parts[3] ?? null;
+  const elapsed  = dur(incident.opened_at, incident.resolved_at ?? undefined);
+
+  const rows: [string, React.ReactNode][] = [
+    ["Status",    <StatusBadge key="st" value={incident.status} showDot />],
+    ["Severity",  <StatusBadge key="sv" value={incident.severity} showDot />],
+    ["Device",    incident.primary_hostname ?? incident.primary_source_ip],
+    ["Protocol",  incident.event_family?.toUpperCase()],
+    ...(iface    ? [["Interface",  iface]    as [string, React.ReactNode]] : []),
+    ...(neighbor ? [["Neighbor",   neighbor] as [string, React.ReactNode]] : []),
+    ["Site",      incident.site || "—"],
+    ["Duration",  elapsed],
+    ["Events",    String(incident.event_count)],
+    ["Opened",    fmtTime(incident.opened_at)],
+    ["Last seen", fmtTime(incident.last_seen_at)],
+    ...(incident.resolved_at ? [["Resolved", fmtTime(incident.resolved_at)] as [string, React.ReactNode]] : []),
+  ];
+
+  const sections = [
+    { id: "what-to-do",   label: "What to do" },
+    ...(troubleshoot ? [{ id: "investigation", label: "Investigation" }] : []),
+    ...(data.proposal    ? [{ id: "remediation",   label: "Remediation Plan" }] : []),
+    { id: "evidence",    label: "Syslog Evidence" },
+    { id: "timeline",    label: "Timeline" },
+  ];
+
+  return (
+    <div className="space-y-3">
+      {/* Incident details */}
+      <div className="overflow-hidden rounded-lg border border-white/[0.07] bg-[#0c1220]">
+        <div className="border-b border-white/[0.07] px-4 py-2.5">
+          <span className="text-[0.67rem] font-bold uppercase tracking-widest text-slate-600">Incident Details</span>
+        </div>
+        <table className="w-full">
+          <tbody>
+            {rows.map(([k, v]) => (
+              <tr key={String(k)} className="border-b border-white/[0.04] last:border-0">
+                <td className="px-4 py-[7px] text-[0.72rem] text-slate-600 whitespace-nowrap">{k}</td>
+                <td className="px-4 py-[7px] text-right text-[0.74rem] font-medium text-slate-200">
+                  {typeof v === "string" ? v : v}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Section navigation */}
+      <div className="overflow-hidden rounded-lg border border-white/[0.07] bg-[#0c1220]">
+        <div className="border-b border-white/[0.07] px-4 py-2.5">
+          <span className="text-[0.67rem] font-bold uppercase tracking-widest text-slate-600">On this page</span>
+        </div>
+        <div className="divide-y divide-white/[0.04]">
+          {sections.map(({ id, label }) => (
+            <a key={id} href={`#${id}`}
+              className="flex items-center justify-between px-4 py-2.5 text-[0.78rem] text-slate-500 transition hover:bg-white/[0.03] hover:text-slate-200">
+              {label}
+              <ChevronRight className="h-3 w-3 text-slate-700" />
+            </a>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────── Root component ─────────────────── */
+
+const SEV_BORDER: Record<string, string> = {
+  critical: "border-l-rose-500",
+  warning:  "border-l-amber-500",
+  info:     "border-l-sky-500/60",
+};
 
 export function IncidentDetailClient({ initialData }: { initialData: AIOpsIncidentDetailPayload }) {
-  const [data, setData]           = useState(initialData);
-  const [tab, setTab]             = useState<Tab>("overview");
-  const [pending, startTransition] = useTransition();
-  const [error, setError]         = useState<string | null>(null);
+  const [data, setData]             = useState(initialData);
+  const [pending, startTransition]  = useTransition();
+  const [error, setError]           = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
 
   const incident = data.incident;
 
   const refresh = useCallback(async () => {
-    try { setData(await fetchIncidentDetail(incident.incident_no)); }
-    catch { /* ignore */ }
+    try { setData(await fetchIncidentDetail(incident.incident_no)); } catch { /* ignore */ }
   }, [incident.incident_no]);
 
   useEffect(() => {
@@ -128,382 +723,125 @@ export function IncidentDetailClient({ initialData }: { initialData: AIOpsIncide
     return () => clearInterval(id);
   }, [refresh]);
 
-  const withAction = (name: string, action: () => Promise<AIOpsIncidentDetailPayload>) => {
+  const withAction = useCallback((name: string, fn: () => Promise<AIOpsIncidentDetailPayload>) => {
     setError(null);
     setActionLoading(name);
     startTransition(async () => {
-      try { setData(await action()); }
-      catch (err) { setError(err instanceof Error ? err.message : "Action failed"); }
+      try { setData(await fn()); }
+      catch (e) { setError(e instanceof Error ? e.message : "Action failed"); }
       finally { setActionLoading(null); }
     });
-  };
+  }, []);
 
-  const bannerCls = SEV_BANNER[incident.severity] ?? "border-l-white/10";
+  const borderCls = SEV_BORDER[incident.severity] ?? "border-l-white/10";
 
   return (
     <div className="space-y-4">
+
       {/* Breadcrumb */}
-      <nav className="flex items-center gap-1.5 text-[0.73rem] text-slate-600">
+      <nav className="flex items-center gap-1 text-[0.72rem] text-slate-600">
         <Link href="/aiops" className="hover:text-slate-300">Dashboard</Link>
-        <span>/</span>
+        <ChevronRight className="h-3 w-3" />
         <Link href="/aiops/incidents" className="hover:text-slate-300">Incidents</Link>
-        <span>/</span>
+        <ChevronRight className="h-3 w-3" />
         <span className="text-slate-400">{incident.incident_no}</span>
       </nav>
 
-      {/* Incident header */}
-      <div className={`rounded-lg border-l-2 border border-white/[0.07] px-4 py-4 ${bannerCls}`}>
+      {/* ── Incident header ── */}
+      <div className={`rounded-lg border-l-2 border border-white/[0.07] bg-[#0c1220] px-5 py-4 ${borderCls}`}>
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <span className="text-[0.66rem] font-semibold uppercase tracking-widest text-slate-600">{incident.incident_no}</span>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-mono text-[0.68rem] font-bold text-slate-600">{incident.incident_no}</span>
               <StatusBadge value={incident.severity} showDot />
               <StatusBadge value={incident.status} />
-              {incident.category && <StatusBadge value={incident.category} />}
             </div>
-            <h1 className="mt-1.5 text-[1.05rem] font-semibold text-white">{incident.title}</h1>
-            <p className="mt-0.5 text-[0.78rem] text-slate-500">
+            <h1 className="mt-2 text-[1.08rem] font-bold leading-snug text-white">{incident.title}</h1>
+            <p className="mt-1 text-[0.76rem] text-slate-500">
               {incident.primary_hostname ?? incident.primary_source_ip}
-              <span className="mx-1.5 text-slate-700">·</span>
-              {incident.event_family}
-              <span className="mx-1.5 text-slate-700">·</span>
-              {incident.event_count} event{incident.event_count !== 1 ? "s" : ""}
-              <span className="mx-1.5 text-slate-700">·</span>
-              Opened {relativeTime(incident.opened_at)}
+              <span className="mx-1.5 text-slate-700">·</span>{incident.event_family}
+              <span className="mx-1.5 text-slate-700">·</span>{incident.event_count} event{incident.event_count !== 1 ? "s" : ""}
+              <span className="mx-1.5 text-slate-700">·</span>Opened {relativeTime(incident.opened_at)}
             </p>
           </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={refresh}
-              className="rounded border border-white/8 bg-white/[0.04] p-1.5 text-slate-500 transition hover:bg-white/[0.08] hover:text-slate-200"
-            >
-              <RefreshCw className="h-3.5 w-3.5" />
-            </button>
-          </div>
         </div>
+
+        {/* Disposition summary line */}
+        {data.troubleshoot && (
+          <div className="mt-3">
+            <DispositionBanner
+              disposition={data.troubleshoot.disposition}
+            />
+          </div>
+        )}
 
         {/* Action bar */}
-        <div className="mt-4 flex flex-wrap gap-2">
-          <button
-            disabled={pending}
-            onClick={() => withAction("troubleshoot", () => runTroubleshoot(incident.incident_no))}
-            className="inline-flex items-center gap-1.5 rounded border border-cyan-500/25 bg-cyan-500/10 px-3 py-1.5 text-[0.78rem] font-medium text-cyan-300 transition hover:bg-cyan-500/15 disabled:opacity-50"
-          >
-            {actionLoading === "troubleshoot" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wrench className="h-3.5 w-3.5" />}
-            Run AI Troubleshoot
-          </button>
-          <button
-            disabled={pending}
-            onClick={() => withAction("verify", () => submitRecoveryDecision(incident.incident_no, { healed: true, note: "Recovery confirmed by operator." }))}
-            className="inline-flex items-center gap-1.5 rounded border border-emerald-500/25 bg-emerald-500/10 px-3 py-1.5 text-[0.78rem] font-medium text-emerald-300 transition hover:bg-emerald-500/15 disabled:opacity-50"
-          >
-            {actionLoading === "verify" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
-            Mark Recovered
-          </button>
-          {data.proposal && (
-            <>
-              <button
-                disabled={pending}
-                onClick={() => withAction("approve", () => approveProposal(incident.incident_no, "lab-operator"))}
-                className="inline-flex items-center gap-1.5 rounded border border-fuchsia-500/25 bg-fuchsia-500/10 px-3 py-1.5 text-[0.78rem] font-medium text-fuchsia-300 transition hover:bg-fuchsia-500/15 disabled:opacity-50"
-              >
-                {actionLoading === "approve" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ShieldAlert className="h-3.5 w-3.5" />}
-                Approve Proposal
+        {incident.status === "verifying" ? (
+          /* Verifying — prominent recovery confirm banner */
+          <div className="mt-4 rounded-lg border border-emerald-500/25 bg-emerald-500/[0.05] px-4 py-3">
+            <p className="mb-2.5 flex items-center gap-2 text-[0.78rem] font-semibold text-emerald-300">
+              <Eye className="h-3.5 w-3.5" />
+              Remediation executed — confirm recovery status
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <button disabled={pending}
+                onClick={() => withAction("verify", () => submitRecoveryDecision(incident.incident_no, { healed: true, note: "Recovery confirmed by operator." }))}
+                className="inline-flex items-center gap-2 rounded border border-emerald-500/40 bg-emerald-500/15 px-4 py-2 text-[0.82rem] font-semibold text-emerald-300 transition hover:bg-emerald-500/25 disabled:opacity-40">
+                {actionLoading === "verify" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
+                {actionLoading === "verify" ? "Confirming…" : "Mark Recovered — Close Incident"}
               </button>
-              <button
-                disabled={pending}
-                onClick={() => withAction("execute", () => executeProposal(incident.incident_no, "lab-operator"))}
-                className="inline-flex items-center gap-1.5 rounded border border-orange-500/25 bg-orange-500/10 px-3 py-1.5 text-[0.78rem] font-medium text-orange-300 transition hover:bg-orange-500/15 disabled:opacity-50"
-              >
-                {actionLoading === "execute" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <PlayCircle className="h-3.5 w-3.5" />}
-                Execute
+              <button disabled={pending}
+                onClick={() => withAction("not-healed", () => submitRecoveryDecision(incident.incident_no, { healed: false, note: "Still broken after execution — returned to monitoring." }))}
+                className="inline-flex items-center gap-2 rounded border border-rose-500/30 bg-rose-500/[0.07] px-4 py-2 text-[0.82rem] font-semibold text-rose-400 transition hover:bg-rose-500/15 disabled:opacity-40">
+                {actionLoading === "not-healed" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <XCircle className="h-3.5 w-3.5" />}
+                Mark Still Broken
               </button>
-            </>
-          )}
-        </div>
-        {error && <p className="mt-2 text-[0.78rem] text-rose-400">{error}</p>}
-      </div>
-
-      {/* Tabs */}
-      <div className="flex items-center gap-0 border-b border-white/[0.07]">
-        {TABS.map(({ id, label, icon: Icon }) => (
-          <button
-            key={id}
-            onClick={() => setTab(id)}
-            className={`flex items-center gap-1.5 border-b-2 px-4 py-2.5 text-[0.8rem] font-medium transition ${
-              tab === id
-                ? "border-cyan-400 text-cyan-300"
-                : "border-transparent text-slate-500 hover:border-white/20 hover:text-slate-300"
-            }`}
-          >
-            <Icon className="h-3.5 w-3.5" />
-            {label}
-          </button>
-        ))}
-      </div>
-
-      {/* ── Tab: Overview ─────────────────────────────────────────────────── */}
-      {tab === "overview" && (
-        <div className="grid gap-4 xl:grid-cols-[1fr_320px]">
-          <div className="space-y-4">
-            {/* AI Summary */}
-            <SectionCard title="AI Assessment" eyebrow="Triage">
-              {data.ai_summary ? (
-                <div className="space-y-3">
-                  <p className="text-[0.88rem] leading-7 text-slate-200">{data.ai_summary.summary}</p>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <ConfidencePill score={data.ai_summary.confidence_score} />
-                    <StatusBadge value={data.ai_summary.category} />
-                  </div>
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    <div>
-                      <p className="mb-1.5 text-[0.67rem] font-semibold uppercase tracking-widest text-slate-600">Probable Cause</p>
-                      <p className="text-[0.82rem] leading-6 text-slate-300">{data.ai_summary.probable_cause}</p>
-                    </div>
-                    <div>
-                      <p className="mb-1.5 text-[0.67rem] font-semibold uppercase tracking-widest text-slate-600">Impact</p>
-                      <p className="text-[0.82rem] leading-6 text-slate-300">{data.ai_summary.impact}</p>
-                    </div>
-                  </div>
-                  {data.ai_summary.suggested_checks.length > 0 && (
-                    <div>
-                      <p className="mb-2 text-[0.67rem] font-semibold uppercase tracking-widest text-slate-600">Suggested Checks</p>
-                      <ol className="space-y-1.5">
-                        {data.ai_summary.suggested_checks.map((item, i) => (
-                          <li key={i} className="flex gap-2 text-[0.8rem] text-slate-300">
-                            <span className="mt-0.5 shrink-0 font-mono text-[0.65rem] text-slate-600">{i + 1}.</span>
-                            <span className="leading-6">{item}</span>
-                          </li>
-                        ))}
-                      </ol>
-                    </div>
-                  )}
-                </div>
-              ) : (
-                <p className="text-[0.82rem] text-slate-600">No AI summary yet. Run troubleshoot to generate an assessment.</p>
-              )}
-            </SectionCard>
-
-            {/* Latest evidence */}
-            {data.raw_logs[0] && (
-              <SectionCard title="Latest Signal" eyebrow="Evidence">
-                <div className="rounded border border-white/8 bg-[#060b14] p-3">
-                  <div className="mb-2 flex items-center gap-2 text-[0.66rem] text-slate-600">
-                    <Clock className="h-3 w-3" />
-                    <span>{fmt(data.raw_logs[0].received_at)}</span>
-                    <span className="mx-1">·</span>
-                    <span className="font-mono">{data.raw_logs[0].source_ip}</span>
-                  </div>
-                  <pre className="whitespace-pre-wrap text-[0.8rem] leading-6 text-slate-300">{data.raw_logs[0].raw_message}</pre>
-                </div>
-              </SectionCard>
-            )}
-          </div>
-
-          {/* Right column: lifecycle */}
-          <div className="space-y-4">
-            <SectionCard title="Lifecycle" eyebrow="Status">
-              <div className="divide-y divide-white/[0.06]">
-                <StatRow label="Status" value={<StatusBadge value={incident.status} showDot />} />
-                <StatRow label="Severity" value={<StatusBadge value={incident.severity} showDot />} />
-                <StatRow label="Recovery" value={incident.current_recovery_state} />
-                <StatRow label="Opened" value={fmt(incident.opened_at)} />
-                <StatRow label="Last seen" value={fmt(incident.last_seen_at)} />
-                {incident.resolved_at && <StatRow label="Resolved" value={fmt(incident.resolved_at)} />}
-                <StatRow label="Resolution" value={incident.resolution_type ?? "Pending"} />
-                <StatRow label="Events" value={incident.event_count} />
-                <StatRow label="Reopened" value={incident.reopened_count} />
-              </div>
-            </SectionCard>
-
-            {data.proposal && (
-              <SectionCard title="Proposal Status" eyebrow="Change">
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <StatusBadge value={data.proposal.status} />
-                    <RiskBadge level={data.proposal.risk_level} />
-                  </div>
-                  <p className="text-[0.82rem] font-semibold text-slate-200">{data.proposal.title}</p>
-                  {data.proposal.target_devices?.length ? (
-                    <p className="text-[0.73rem] text-slate-500">Target: {data.proposal.target_devices.join(", ")}</p>
-                  ) : null}
-                </div>
-              </SectionCard>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* ── Tab: Investigation ────────────────────────────────────────────── */}
-      {tab === "investigation" && (
-        <div className="space-y-4">
-          {data.troubleshoot ? (
-            <SectionCard title="Troubleshoot Result" eyebrow="AI Investigation">
-              <div className="space-y-3">
-                <div className="flex items-center gap-2">
-                  <StatusBadge value={data.troubleshoot.disposition} />
-                </div>
-                <p className="text-[0.87rem] font-medium leading-7 text-slate-100">{data.troubleshoot.summary}</p>
-                <p className="text-[0.82rem] leading-7 text-slate-400">{data.troubleshoot.conclusion}</p>
-
-                {data.troubleshoot.steps?.length > 0 && (
-                  <div className="mt-2 space-y-2">
-                    <p className="text-[0.67rem] font-semibold uppercase tracking-widest text-slate-600">CLI Investigation Steps</p>
-                    {data.troubleshoot.steps.map((step, i) => (
-                      <div key={i} className="rounded border border-white/8 bg-[#060b14]">
-                        <div className="flex items-center justify-between border-b border-white/[0.06] px-3 py-2">
-                          <div className="flex items-center gap-2">
-                            <span className="text-[0.65rem] font-mono text-slate-600">step {i + 1}</span>
-                            <span className="text-[0.78rem] font-semibold text-cyan-400">{step.tool_name}</span>
-                          </div>
-                          <CopyButton text={step.content} />
-                        </div>
-                        <pre className="max-h-40 overflow-auto p-3 text-[0.74rem] leading-6 text-slate-300">
-                          {step.content}
-                        </pre>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </SectionCard>
-          ) : (
-            <SectionCard title="No Investigation Yet" eyebrow="AI Investigation">
-              <p className="text-[0.82rem] text-slate-600">Run AI Troubleshoot from the header to start an investigation.</p>
-            </SectionCard>
-          )}
-
-          {data.proposal ? (
-            <SectionCard
-              title="Remediation Proposal"
-              eyebrow="Change Plan"
-              actions={
-                <div className="flex items-center gap-2">
-                  <RiskBadge level={data.proposal.risk_level} />
-                  <StatusBadge value={data.proposal.status} />
-                </div>
-              }
-            >
-              <div className="space-y-3">
-                <p className="text-[0.86rem] font-semibold text-slate-100">{data.proposal.title}</p>
-                <p className="text-[0.8rem] leading-6 text-slate-400">{data.proposal.rationale}</p>
-                {data.proposal.target_devices?.length ? (
-                  <p className="text-[0.73rem] text-slate-500">Target devices: {data.proposal.target_devices.join(", ")}</p>
-                ) : null}
-                <CodeBlock title="Commands" content={data.proposal.commands.join("\n")} color="text-cyan-200" />
-                {data.proposal.verification_commands?.length > 0 && (
-                  <CodeBlock title="Verification" content={data.proposal.verification_commands.join("\n")} color="text-emerald-200" />
-                )}
-                {data.proposal.rollback_plan && (
-                  <CodeBlock title="Rollback" content={data.proposal.rollback_plan} color="text-amber-200" />
-                )}
-              </div>
-            </SectionCard>
-          ) : null}
-
-          {data.execution ? (
-            <SectionCard
-              title="Execution Record"
-              eyebrow="Last Run"
-              actions={<StatusBadge value={data.execution.status} />}
-            >
-              <div className="space-y-3">
-                <p className="text-[0.78rem] text-slate-500">Executed by <strong className="text-slate-300">{data.execution.executed_by}</strong></p>
-                <CodeBlock title="Output" content={data.execution.output} />
-                {data.execution.verification_notes && (
-                  <p className="text-[0.78rem] text-slate-400">{data.execution.verification_notes}</p>
-                )}
-              </div>
-            </SectionCard>
-          ) : null}
-        </div>
-      )}
-
-      {/* ── Tab: Evidence ─────────────────────────────────────────────────── */}
-      {tab === "evidence" && (
-        <div className="grid gap-4 xl:grid-cols-2">
-          <SectionCard title="Raw Logs" eyebrow={`${data.raw_logs.length} entries`} noPadding>
-            {data.raw_logs.length ? (
-              <div className="divide-y divide-white/[0.05]">
-                {data.raw_logs.map((log) => (
-                  <div key={log.id} className="px-4 py-3">
-                    <div className="mb-1 flex items-center gap-2 text-[0.64rem] text-slate-600">
-                      <span className="font-mono">{log.source_ip}</span>
-                      <span>·</span>
-                      <span>{fmt(log.received_at)}</span>
-                    </div>
-                    <pre className="whitespace-pre-wrap text-[0.78rem] leading-6 text-slate-300">{log.raw_message}</pre>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="px-4 py-5 text-[0.8rem] text-slate-600">No raw logs attached.</p>
-            )}
-          </SectionCard>
-
-          <SectionCard title="Normalized Events" eyebrow={`${data.events.length} events`} noPadding>
-            {data.events.length ? (
-              <div className="divide-y divide-white/[0.05]">
-                {data.events.map((ev) => (
-                  <div key={ev.id} className="px-4 py-3">
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-2">
-                        <StatusBadge value={ev.event_state} />
-                        <StatusBadge value={ev.severity} showDot />
-                      </div>
-                      <span className="text-[0.64rem] text-slate-600">{relativeTime(ev.created_at)}</span>
-                    </div>
-                    <p className="mt-1 text-[0.82rem] font-semibold text-slate-200">{ev.title}</p>
-                    <p className="text-[0.73rem] text-slate-500">{ev.event_family} · {ev.correlation_key}</p>
-                    {ev.raw_message && (
-                      <pre className="mt-1 truncate text-[0.72rem] text-slate-600">{ev.raw_message}</pre>
-                    )}
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="px-4 py-5 text-[0.8rem] text-slate-600">No events attached.</p>
-            )}
-          </SectionCard>
-        </div>
-      )}
-
-      {/* ── Tab: Timeline ─────────────────────────────────────────────────── */}
-      {tab === "timeline" && (
-        <SectionCard title="Incident Timeline" eyebrow="Audit Trail" noPadding>
-          {data.timeline.length ? (
-            <div className="relative pl-4">
-              <div className="absolute bottom-0 left-[1.65rem] top-4 w-px bg-white/[0.06]" />
-              <div className="space-y-0 divide-y divide-white/[0.05]">
-                {data.timeline.map((entry) => (
-                  <div key={entry.id} className="flex gap-3 py-3.5 pl-4 pr-4">
-                    <div className="relative z-10 mt-0.5 h-2.5 w-2.5 shrink-0 rounded-full bg-white/10 ring-2 ring-[#0c1220]" />
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <StatusBadge value={entry.kind} />
-                        <p className="text-[0.82rem] font-semibold text-slate-200">{entry.title}</p>
-                        <span className="ml-auto text-[0.66rem] text-slate-600">{fmt(entry.created_at)}</span>
-                      </div>
-                      <p className="mt-1 text-[0.78rem] leading-6 text-slate-400">{entry.body}</p>
-                    </div>
-                  </div>
-                ))}
-              </div>
+              <button disabled={pending}
+                onClick={() => withAction("troubleshoot", () => runTroubleshoot(incident.incident_no))}
+                className="inline-flex items-center gap-1.5 rounded border border-white/[0.08] bg-white/[0.03] px-3 py-2 text-[0.78rem] text-slate-400 transition hover:border-white/14 hover:text-slate-200 disabled:opacity-50">
+                {actionLoading === "troubleshoot" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wrench className="h-3.5 w-3.5" />}
+                Re-investigate
+              </button>
+              {error && <p className="text-[0.78rem] text-rose-400">{error}</p>}
             </div>
-          ) : (
-            <p className="px-4 py-5 text-[0.8rem] text-slate-600">No timeline entries yet.</p>
-          )}
-        </SectionCard>
-      )}
+          </div>
+        ) : (
+          <div className="mt-4 flex flex-wrap items-center gap-2">
+            <button disabled={pending}
+              onClick={() => withAction("troubleshoot", () => runTroubleshoot(incident.incident_no))}
+              className="inline-flex items-center gap-1.5 rounded border border-cyan-500/25 bg-cyan-500/[0.08] px-3 py-1.5 text-[0.78rem] font-medium text-cyan-300 transition hover:bg-cyan-500/15 disabled:opacity-50">
+              {actionLoading === "troubleshoot" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Wrench className="h-3.5 w-3.5" />}
+              {actionLoading === "troubleshoot" ? "Investigating…" : data.troubleshoot ? "Re-run Troubleshoot" : "Run AI Troubleshoot"}
+            </button>
+            <button disabled={pending}
+              onClick={() => withAction("verify", () => submitRecoveryDecision(incident.incident_no, { healed: true, note: "Recovery confirmed by operator." }))}
+              className="inline-flex items-center gap-1.5 rounded border border-emerald-500/25 bg-emerald-500/[0.08] px-3 py-1.5 text-[0.78rem] font-medium text-emerald-300 transition hover:bg-emerald-500/15 disabled:opacity-50">
+              {actionLoading === "verify" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
+              Mark Recovered
+            </button>
+            {error && <p className="text-[0.78rem] text-rose-400">{error}</p>}
+          </div>
+        )}
+      </div>
 
-      {/* Full logs link */}
-      <div className="flex justify-end">
-        <Link
-          href={`/aiops/logs?incident=${incident.incident_no}`}
-          className="text-[0.73rem] text-slate-600 transition hover:text-cyan-400"
-        >
-          View all raw logs for {incident.incident_no} →
-        </Link>
+      {/* ── Two-column body ── */}
+      <div className="grid gap-5 xl:grid-cols-[1fr_300px]">
+
+        {/* Main scroll column */}
+        <div className="space-y-4 min-w-0">
+          <div id="what-to-do"><WhatToDoNext data={data} /></div>
+          <InvestigationSection data={data} loading={actionLoading === "troubleshoot"} />
+          <RemediationPlan data={data} withAction={withAction} actionLoading={actionLoading} />
+          <SyslogSection data={data} />
+          <TimelineSection entries={data.timeline} />
+        </div>
+
+        {/* Sticky sidebar */}
+        <div className="hidden xl:block">
+          <div className="sticky top-16">
+            <Sidebar data={data} />
+          </div>
+        </div>
       </div>
     </div>
   );
