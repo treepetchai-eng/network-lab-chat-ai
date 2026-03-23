@@ -58,6 +58,17 @@ def validate_command(command: str) -> tuple[bool, str]:
     if not cmd:
         return False, "Empty command."
 
+    # Reject multi-line commands — newlines would cause Netmiko to send
+    # multiple commands to the device, bypassing prefix validation on each.
+    if "\n" in cmd or "\r" in cmd:
+        # Collapse to the first non-empty line so the caller can see what
+        # the first line was, but still block it.
+        first_line = next((ln.strip() for ln in cmd.splitlines() if ln.strip()), "")
+        return False, (
+            f"Multi-line commands are not allowed. "
+            f"Send one command at a time. First line was: '{first_line}'."
+        )
+
     # Block dangerous commands first (takes priority)
     if BLOCKED_CMD_RE.match(cmd):
         return False, (

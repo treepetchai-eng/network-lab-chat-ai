@@ -1,8 +1,9 @@
 "use client";
 
 import Image from "next/image";
+import Link from "next/link";
 import { motion } from "framer-motion";
-import { Plus } from "lucide-react";
+import { LayoutDashboard, Plus } from "lucide-react";
 import { useState } from "react";
 import { ConfirmDialog } from "@/components/layout/confirm-dialog";
 
@@ -50,13 +51,22 @@ export function TopHeader({ onNewChat, hasMessages }: TopHeaderProps) {
                 <p className="hidden text-[0.72rem] text-slate-500 sm:block">AI-powered network chat assistant</p>
               </div>
             </div>
-            <button
-              onClick={handleNewChat}
-              className="group inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-xs text-slate-300 transition-all duration-300 hover:border-cyan-300/22 hover:bg-cyan-400/[0.07] hover:text-white hover:shadow-[0_0_20px_rgba(34,211,238,0.08)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/30 active:scale-[0.97] sm:gap-2 sm:rounded-2xl sm:px-3.5 sm:py-2 sm:text-sm"
-            >
-              <Plus className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
-              <span className="hidden xs:inline">New Chat</span>
-            </button>
+            <div className="flex items-center gap-2">
+              <Link
+                href="/aiops"
+                className="group inline-flex items-center gap-1.5 rounded-xl border border-cyan-300/16 bg-cyan-400/[0.07] px-2.5 py-1.5 text-xs text-cyan-100 transition-all duration-300 hover:border-cyan-300/28 hover:bg-cyan-400/[0.12] hover:text-white hover:shadow-[0_0_22px_rgba(34,211,238,0.12)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/30 active:scale-[0.97] sm:gap-2 sm:rounded-2xl sm:px-3.5 sm:py-2 sm:text-sm"
+              >
+                <LayoutDashboard className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
+                <span className="hidden xs:inline">AIOps Console</span>
+              </Link>
+              <button
+                onClick={handleNewChat}
+                className="group inline-flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-2.5 py-1.5 text-xs text-slate-300 transition-all duration-300 hover:border-cyan-300/22 hover:bg-cyan-400/[0.07] hover:text-white hover:shadow-[0_0_20px_rgba(34,211,238,0.08)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/30 active:scale-[0.97] sm:gap-2 sm:rounded-2xl sm:px-3.5 sm:py-2 sm:text-sm"
+              >
+                <Plus className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
+                <span className="hidden xs:inline">New Chat</span>
+              </button>
+            </div>
           </div>
         </div>
       </motion.header>

@@ -22,6 +22,8 @@ def _load_rows() -> list[dict]:
 
 
 def _row_to_json(row: dict) -> str:
+    tunnel_ips_raw = row.get("tunnel_ips", "") or ""
+    tunnel_ips = [ip.strip() for ip in tunnel_ips_raw.split() if ip.strip()]
     return json.dumps({
         "hostname":    row["hostname"],
         "ip_address":  row["ip_address"],
@@ -29,6 +31,7 @@ def _row_to_json(row: dict) -> str:
         "device_role": row["device_role"],
         "site":        row["site"],
         "version":     row["version"],
+        "tunnel_ips":  tunnel_ips,
     })
 
 
@@ -62,6 +65,12 @@ def lookup_device(hostname: str) -> str:
     if _IP_RE.match(search):
         for row in rows:
             if row["ip_address"] == search:
+                return _row_to_json(row)
+        # 1b. Tunnel/interface IP match
+        for row in rows:
+            tunnel_ips_raw = row.get("tunnel_ips", "") or ""
+            tunnel_ips = [ip.strip() for ip in tunnel_ips_raw.split() if ip.strip()]
+            if search in tunnel_ips:
                 return _row_to_json(row)
         return json.dumps({
             "error":       f"No device with IP '{search}' in inventory.",
