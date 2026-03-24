@@ -104,27 +104,18 @@ export function VulnerabilitiesClient({ initialData, initialError }: Props) {
   const [scanning, setScanning] = useState<"idle" | "all" | Set<string>>("idle");
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<"all" | "critical" | "high" | "unscanned">("all");
-  // Track "scan all" polling: how many devices remain + poll interval ref
-  const [scanProgress, setScanProgress] = useState<{ total: number; scannedBefore: number } | null>(null);
+  // toScan = devices that need scanning, startedAt = epoch ms when scan fired
+  const scanStateRef = useRef<{ toScan: number; startedAt: number } | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const summary = data?.summary;
   const devices = data?.devices ?? [];
 
-  /* ── stop polling when scan is done ─────────────────────────────────── */
-  useEffect(() => {
-    if (!scanProgress) return;
-    const scannedNow = data?.summary?.scanned_devices ?? 0;
-    if (scannedNow >= scanProgress.total || scannedNow > scanProgress.scannedBefore) {
-      // At least one device finished — keep polling until all done
-      if (scannedNow >= scanProgress.total) {
-        if (pollRef.current) clearInterval(pollRef.current);
-        pollRef.current = null;
-        setScanProgress(null);
-        setScanning("idle");
-      }
-    }
-  }, [data, scanProgress]);
+  function stopPolling() {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+    scanStateRef.current = null;
+    setScanning("idle");
+  }
 
   useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
 
@@ -161,19 +152,42 @@ export function VulnerabilitiesClient({ initialData, initialError }: Props) {
       const res = await triggerScanAll();
       const toScan = res.to_scan ?? 0;
       if (toScan === 0) {
-        // Nothing to scan (all recently completed) — show message and stop
         setScanning("idle");
         setError(res.message ?? "All devices were recently scanned.");
         return;
       }
-      const scannedBefore = data?.summary?.scanned_devices ?? 0;
-      setScanProgress({ total: scannedBefore + toScan, scannedBefore });
-      // Poll every 5s to refresh progress
+
+      const startedAt = Date.now();
+      // max wait = 60s per device, hard cap 10 min
+      const maxWaitMs = Math.min(toScan * 60_000, 600_000);
+      scanStateRef.current = { toScan, startedAt };
+
       if (pollRef.current) clearInterval(pollRef.current);
       pollRef.current = setInterval(async () => {
+        const state = scanStateRef.current;
+        if (!state) { stopPolling(); return; }
+
+        // Hard timeout — stop no matter what
+        if (Date.now() - state.startedAt > maxWaitMs) {
+          stopPolling();
+          return;
+        }
+
         try {
-          setData(await fetchVulnerabilitySummary());
-        } catch { /* ignore poll errors */ }
+          const fresh = await fetchVulnerabilitySummary();
+          setData(fresh);
+
+          // Check if all "error+unscanned" devices now have a fresh scan
+          // A fresh scan = scanned_at AFTER our startedAt timestamp
+          const freshScanned = (fresh.devices ?? []).filter((d) => {
+            if (!d.scanned_at) return false;
+            return new Date(d.scanned_at).getTime() >= state.startedAt;
+          }).length;
+
+          if (freshScanned >= state.toScan) {
+            stopPolling();
+          }
+        } catch { /* keep polling */ }
       }, 5000);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Scan all failed");
@@ -251,9 +265,9 @@ export function VulnerabilitiesClient({ initialData, initialError }: Props) {
             {scanning === "all" ? (
               <>
                 <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                {scanProgress
-                  ? `Scanning… ${data?.summary?.scanned_devices ?? 0}/${scanProgress.total}`
-                  : "Starting scan…"}
+                {scanStateRef.current
+                  ? `Scanning… (${scanStateRef.current.toScan} devices)`
+                  : "Starting…"}
               </>
             ) : (
               <>
