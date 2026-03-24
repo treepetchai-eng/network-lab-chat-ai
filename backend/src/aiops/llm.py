@@ -332,6 +332,7 @@ def decide_incident_bundle(
     raw_logs: list[dict[str, Any]],
     device: dict[str, Any] | None,
     open_incidents: list[dict[str, Any]],
+    interface_desc_context: str | None = None,
 ) -> dict[str, Any]:
     fallback = _fallback_bundle_decision(
         candidate_group=candidate_group,
@@ -395,6 +396,20 @@ def decide_incident_bundle(
         ],
         "open_incident_context": _open_incident_context_text(open_incidents),
     }
+    if interface_desc_context:
+        prompt["interface_description"] = interface_desc_context
+
+    interface_desc_guidance = ""
+    if interface_desc_context:
+        interface_desc_guidance = (
+            f"\n\nINTERFACE CONTEXT: {interface_desc_context}\n"
+            "Use this description to judge the operational importance of the interface. "
+            "Examples: description 'unused' / 'spare' / 'decommissioned' / 'do not use' → the port is intentionally inactive, return action=ignore. "
+            "description 'WAN-TO-ISP' / 'TO-HQ-CORE-RT01' / 'UPLINK' → the port is critical, create incident. "
+            "description 'BACKUP-LINK' → create incident but consider lower severity. "
+            "Always mention the interface description in your reasoning field."
+        )
+
     sys_msg = SystemMessage(
         content=(
             "You are the incident-decision engine for a network AIOps platform and you reason from grouped evidence, not a single log line. "
@@ -405,6 +420,7 @@ def decide_incident_bundle(
             "Return strict JSON with keys: action, incident_no, title, event_family, event_state, severity, summary, correlation_key, category, reasoning, metadata. "
             "Valid action values: create_incident, update_incident, ignore. "
             "Valid categories: physical, logical, config-related, external, unknown."
+            + interface_desc_guidance
         )
     )
     for _attempt in range(2):

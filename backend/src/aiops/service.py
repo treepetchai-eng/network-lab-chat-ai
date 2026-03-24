@@ -341,6 +341,17 @@ class AIOpsService:
             checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
 
+        CREATE TABLE IF NOT EXISTS interface_descriptions (
+            id BIGSERIAL PRIMARY KEY,
+            device_id BIGINT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+            interface_name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT '',
+            protocol TEXT NOT NULL DEFAULT '',
+            refreshed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (device_id, interface_name)
+        );
+
         """
         with connect() as conn:
             with conn.cursor() as cur:
@@ -999,6 +1010,113 @@ class AIOpsService:
         )
         return cur.fetchone()
 
+    # ── Interface description cache ──────────────────────────────────────────────
+
+    # How long (seconds) to trust a cached interface description before re-fetching.
+    _INTF_DESC_CACHE_TTL: int = 600  # 10 minutes
+
+    def _get_interface_description_cached(
+        self,
+        cur: psycopg.Cursor[Any],
+        device_id: int,
+        interface_name: str,
+    ) -> tuple[str | None, bool]:
+        """Return (description, cache_fresh).
+
+        cache_fresh=False means the cache is missing or stale — caller should re-fetch.
+        """
+        cur.execute(
+            """
+            SELECT description, refreshed_at
+            FROM interface_descriptions
+            WHERE device_id = %s
+              AND lower(interface_name) = lower(%s)
+            """,
+            (device_id, interface_name),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None, False
+        age = (datetime.now(timezone.utc) - row["refreshed_at"]).total_seconds()
+        return row["description"], age < self._INTF_DESC_CACHE_TTL
+
+    def _refresh_interface_descriptions(
+        self,
+        device: dict[str, Any],
+    ) -> dict[str, str]:
+        """SSH to device, run 'show interfaces description', parse and persist to DB.
+
+        Returns dict {interface_name: description}. Never raises — errors return {}.
+        """
+        hostname = device.get("hostname", "")
+        ip_address = device.get("ip_address", "")
+        os_platform = device.get("os_platform", "cisco_ios")
+        device_id = device.get("id")
+        if not ip_address or not device_id:
+            return {}
+        try:
+            from src.tools.cli_tool import create_run_cli_tool
+            device_cache = {
+                hostname: {
+                    "ip_address": ip_address,
+                    "os_platform": os_platform,
+                    "device_role": device.get("device_role", ""),
+                    "site": device.get("site", ""),
+                }
+            }
+            run_cli = create_run_cli_tool(device_cache)
+            raw_output = str(run_cli.invoke({"host": hostname, "command": "show interfaces description"}))
+        except Exception as exc:
+            logger.warning("refresh_interface_descriptions SSH failed for %s: %s", hostname, exc)
+            return {}
+
+        # Parse 'show interfaces description' output:
+        # Interface   Status    Protocol  Description
+        # Gi0/0       up        up        TO-PROXMOX-LAN
+        desc_map: dict[str, dict[str, str]] = {}
+        import re as _re
+        for line in raw_output.splitlines():
+            # Match: <intf>   <status>   <protocol>   [description]
+            m = _re.match(
+                r"^(\S+)\s+(admin\s+down|up|down)\s+(up|down|-)\s*(.*)?$",
+                line.strip(),
+                _re.IGNORECASE,
+            )
+            if m:
+                intf = m.group(1)
+                status = m.group(2).strip().lower()
+                protocol = m.group(3).strip().lower()
+                desc = m.group(4).strip() if m.group(4) else ""
+                desc_map[intf] = {"status": status, "protocol": protocol, "description": desc}
+
+        if not desc_map:
+            return {}
+
+        # Persist to DB
+        try:
+            with connect() as conn:
+                with conn.cursor() as cur:
+                    for intf, info in desc_map.items():
+                        cur.execute(
+                            """
+                            INSERT INTO interface_descriptions
+                                (device_id, interface_name, description, status, protocol, refreshed_at)
+                            VALUES (%s, %s, %s, %s, %s, NOW())
+                            ON CONFLICT (device_id, interface_name)
+                            DO UPDATE SET
+                                description  = EXCLUDED.description,
+                                status       = EXCLUDED.status,
+                                protocol     = EXCLUDED.protocol,
+                                refreshed_at = NOW()
+                            """,
+                            (device_id, intf, info["description"], info["status"], info["protocol"]),
+                        )
+                conn.commit()
+        except Exception as exc:
+            logger.warning("Failed to persist interface_descriptions for %s: %s", hostname, exc)
+
+        return {intf: info["description"] for intf, info in desc_map.items()}
+
     def _upsert_candidate_group(
         self,
         cur: psycopg.Cursor[Any],
@@ -1231,12 +1349,38 @@ class AIOpsService:
                         (list(_OPEN_INCIDENT_STATUSES),),
                     )
                     open_incidents = cur.fetchall()
+
+                    # ── Interface description context for LLM ────────────────
+                    # For interface events, look up the cached description so the
+                    # LLM can judge business impact (e.g. "unused" → ignore).
+                    interface_desc_context: str | None = None
+                    if group.get("event_family") == "interface" and device:
+                        latest_event = events[0] if events else {}
+                        intf_name = (latest_event.get("metadata") or {}).get("interface")
+                        if intf_name:
+                            cached_desc, fresh = self._get_interface_description_cached(
+                                cur, device["id"], intf_name
+                            )
+                            if not fresh:
+                                # Refresh in background; use stale value if available
+                                import threading as _threading
+                                _threading.Thread(
+                                    target=self._refresh_interface_descriptions,
+                                    args=(device,),
+                                    daemon=True,
+                                ).start()
+                            if cached_desc is not None:
+                                interface_desc_context = (
+                                    f"Interface {intf_name} description from device: '{cached_desc}'"
+                                )
+
                     decision = decide_incident_bundle(
                         candidate_group=group,
                         events=events,
                         raw_logs=raw_logs,
                         device=device,
                         open_incidents=open_incidents,
+                        interface_desc_context=interface_desc_context,
                     )
                     incident_id = self._apply_bundle_decision(
                         cur,
