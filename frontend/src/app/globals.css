@@ -316,4 +316,27 @@
   .ui-copy-tight {
     @apply text-[0.84rem] leading-5 sm:text-[0.93rem] sm:leading-6;
   }
+
+  /* Restore pointer cursor on interactive elements (Tailwind preflight resets button to default) */
+  button:not(:disabled),
+  select,
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+  button:disabled,
+  [role="button"][aria-disabled="true"] {
+    cursor: not-allowed;
+  }
+
+  /* Compact overrides for incident chat panel (embedded, not full-screen) */
+  .incident-chat .ui-copy {
+    font-size: 0.8rem;
+    line-height: 1.55;
+  }
+  .incident-chat h1 { font-size: 1rem !important; margin-top: 0.75rem !important; margin-bottom: 0.5rem !important; }
+  .incident-chat h2 { font-size: 0.87rem !important; margin-top: 0.6rem !important; margin-bottom: 0.4rem !important; }
+  .incident-chat h3 { font-size: 0.81rem !important; margin-top: 0.5rem !important; margin-bottom: 0.35rem !important; }
+  .incident-chat table { font-size: 0.74rem !important; }
+  .incident-chat td, .incident-chat th { padding: 0.35rem 0.75rem !important; font-size: 0.74rem !important; }
+  .incident-chat pre code { font-size: 0.67rem !important; line-height: 1.5 !important; }
 }

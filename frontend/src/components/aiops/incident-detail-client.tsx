@@ -4,12 +4,12 @@ import Link from "next/link";
 import { useState, useTransition, useEffect, useCallback } from "react";
 import {
   Activity, AlertTriangle, CheckCircle2, ChevronDown, ChevronRight,
-  ChevronUp, Clock, Copy, Eye, FileSearch, Loader2, MessageSquare,
-  Play, RotateCcw, Server, ShieldAlert, Terminal, Wifi, Wrench, XCircle, Zap,
+  ChevronUp, Clock, Copy, Eye, FileSearch, Loader2, MessageSquare, PenLine,
+  Play, RotateCcw, Send, Server, ShieldAlert, Terminal, Wifi, Wrench, XCircle,
 } from "lucide-react";
 import type { AIOpsIncidentDetailPayload, AIOpsTimelineEntry } from "@/lib/aiops-types";
 import {
-  approveProposal, executeProposal, fetchIncidentDetail,
+  addIncidentNote, approveProposal, executeProposal, fetchIncidentDetail,
   runTroubleshoot, submitRecoveryDecision,
 } from "@/lib/aiops-api";
 import { StatusBadge } from "@/components/aiops/status-badge";
@@ -139,104 +139,6 @@ function DispositionBanner({ disposition, summary }: { disposition: string; summ
   );
 }
 
-/* ─────────────────── What to do next ─────────────────── */
-
-type Step = { num: number; action: string; detail?: string; type?: "primary" | "caution" | "info" };
-
-const RECS: Record<string, Step[]> = {
-  verifying: [
-    { num: 1, action: "Review the execution output in the Remediation Plan below",                    detail: "Confirm the config was applied and verification commands returned expected output.",         type: "primary" },
-    { num: 2, action: "Confirm service is restored — check device or watch syslog",                  detail: "Look for: FULL state / Interface up / Established / Cleared in the logs.",                type: "primary" },
-    { num: 3, action: "Click 'Mark Recovered' below to close this incident",                         detail: "This records resolution time (MTTR) and closes the incident.",                            type: "primary" },
-    { num: 4, action: "If still broken → click 'Mark Still Broken' to re-investigate",              detail: "Incident returns to active state and AI can re-run troubleshoot with new evidence.",       type: "caution" },
-  ],
-  config_fix_possible: [
-    { num: 1, action: "Review the remediation commands in the section below",           detail: "Confirm interface name, device hostname, and change window before proceeding.", type: "primary" },
-    { num: 2, action: "Approve the proposal",                                           detail: "Your name and timestamp will be recorded as the change authoriser.",            type: "primary" },
-    { num: 3, action: "Execute — Netmiko will SSH and apply the config",               detail: "Verification commands run automatically after execution.",                       type: "primary" },
-    { num: 4, action: "Confirm adjacency is restored via syslog or mark recovered",    detail: "Look for: %OSPF-5-ADJCHG…FULL / Interface up.",                                 type: "info"    },
-  ],
-  physical_issue: [
-    { num: 1, action: "Check physical layer on the reported interface",                 detail: "Verify cable seating, SFP, and link LEDs on both sides of the link.",           type: "caution" },
-    { num: 2, action: "Check error counters: show interface <iface>",                  detail: "Look for input errors, CRC, giants, runts — indicates physical layer problem.", type: "primary" },
-    { num: 3, action: "Inspect far-end device port status",                            detail: "Confirm the connected port is up/up.",                                           type: "primary" },
-    { num: 4, action: "Escalate to NOC / field team if hardware swap is needed",       detail: "Document findings and update incident timeline before escalating.",             type: "caution" },
-  ],
-  external_issue: [
-    { num: 1, action: "Contact upstream provider / circuit owner",                     detail: "Reference circuit ID and report the fault start time.",                         type: "caution" },
-    { num: 2, action: "Verify alternate path: show ip route / show bgp summary",      detail: "Confirm if traffic is rerouted via backup path.",                               type: "primary" },
-    { num: 3, action: "Monitor until provider confirms restoration",                   detail: "Log all provider updates in the incident timeline.",                            type: "info"    },
-  ],
-  monitor_further: [
-    { num: 1, action: "Manually verify current state on the device",                   detail: "Run: show ip ospf neighbor / show ip bgp summary / show interface.",           type: "primary" },
-    { num: 2, action: "Re-run AI Troubleshoot after 5–10 min for more data",          detail: "Additional syslog events may have arrived since the last run.",                 type: "info"    },
-    { num: 3, action: "Watch syslog for recurrence or recovery signals",               detail: "Look for: ADJCHG…FULL, Interface up, Established, Cleared.",                  type: "info"    },
-  ],
-  self_recovered: [
-    { num: 1, action: "Verify adjacency is stable: show ip ospf neighbor",             detail: "Confirm state is FULL and has been stable for > 5 minutes.",                   type: "primary" },
-    { num: 2, action: "Check for flapping — if recurred > 3× in 1 hour, investigate", detail: "Flapping indicates an underlying instability (timer mismatch, link quality).", type: "caution" },
-    { num: 3, action: "Mark recovered if stable — or let auto-resolve handle it",     detail: "Incident will auto-close after stability window.",                              type: "info"    },
-  ],
-  needs_human_review: [
-    { num: 1, action: "Check Investigation section for partial CLI evidence",          detail: "AI could not reach a confident conclusion — review raw output manually.",      type: "caution" },
-    { num: 2, action: "SSH into the device and inspect manually",                      detail: "Use the device and interface from the correlation key as starting point.",     type: "primary" },
-    { num: 3, action: "Re-run AI Troubleshoot — newer logs may yield more",           detail: "More syslog events may have arrived and changed the picture.",                  type: "info"    },
-  ],
-};
-
-function WhatToDoNext({ data }: { data: AIOpsIncidentDetailPayload }) {
-  const { troubleshoot, ai_summary, incident } = data;
-  if (["resolved", "closed"].includes(incident.status)) return null;
-
-  let steps: Step[] = [];
-  let label = "What to do next";
-  let sub = "";
-
-  // Verifying state always takes precedence regardless of troubleshoot disposition
-  if (incident.status === "verifying") {
-    steps = RECS.verifying;
-    label = "Verify & Close";
-    sub = "Remediation executed — confirm recovery to close incident";
-  } else if (troubleshoot) {
-    steps = RECS[troubleshoot.disposition] ?? [];
-    sub = `Based on AI investigation · ${troubleshoot.disposition.replaceAll("_", " ")}`;
-  } else if (ai_summary?.suggested_checks?.length) {
-    steps = ai_summary.suggested_checks.map((s, i) => ({ num: i + 1, action: s, type: "info" as const }));
-    label = "Suggested Checks";
-    sub = "Initial triage from syslog text · Run AI Troubleshoot for SSH-verified diagnosis";
-  } else {
-    steps = [{ num: 1, action: "Run AI Troubleshoot to SSH into the device and get a verified diagnosis", detail: "Click the button in the action bar above.", type: "primary" }];
-  }
-
-  if (!steps.length) return null;
-
-  return (
-    <div className="overflow-hidden rounded-lg border border-white/[0.07] bg-[#0c1220]">
-      <div className="flex items-center justify-between border-b border-white/[0.07] px-4 py-3">
-        <div className="flex items-center gap-2">
-          <Zap className="h-3.5 w-3.5 text-amber-400/80" />
-          <span className="text-[0.82rem] font-semibold text-white">{label}</span>
-        </div>
-        {sub && <span className="text-[0.65rem] text-slate-600">{sub}</span>}
-      </div>
-      <div className="divide-y divide-white/[0.05]">
-        {steps.map((s) => {
-          const lc = s.type === "primary" ? "border-l-cyan-500/50"  : s.type === "caution" ? "border-l-amber-500/50" : "border-l-white/[0.07]";
-          const nc = s.type === "primary" ? "bg-cyan-500/15 text-cyan-300" : s.type === "caution" ? "bg-amber-500/15 text-amber-400" : "bg-white/[0.04] text-slate-500";
-          return (
-            <div key={s.num} className={`flex gap-3 border-l-[3px] px-4 py-3 ${lc}`}>
-              <span className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[0.63rem] font-bold ${nc}`}>{s.num}</span>
-              <div>
-                <p className="text-[0.82rem] font-medium text-slate-100">{s.action}</p>
-                {s.detail && <p className="mt-0.5 text-[0.73rem] leading-5 text-slate-500">{s.detail}</p>}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
 
 /* ─────────────────── Remediation plan ─────────────────── */
 
@@ -578,9 +480,35 @@ const TL_ICONS: Record<string, React.ElementType> = {
   execution: Play, recovery: CheckCircle2,
 };
 
-function TimelineSection({ entries }: { entries: AIOpsTimelineEntry[] }) {
+function TimelineSection({
+  entries,
+  incidentNo,
+  onNoteAdded,
+}: {
+  entries: AIOpsTimelineEntry[];
+  incidentNo: string;
+  onNoteAdded: (updated: AIOpsIncidentDetailPayload) => void;
+}) {
   const [expanded, setExpanded] = useState(false);
-  if (!entries.length) return null;
+  const [note, setNote] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [noteError, setNoteError] = useState<string | null>(null);
+
+  const handleSubmitNote = async () => {
+    if (!note.trim() || submitting) return;
+    setSubmitting(true);
+    setNoteError(null);
+    try {
+      const updated = await addIncidentNote(incidentNo, note.trim());
+      setNote("");
+      onNoteAdded(updated);
+    } catch {
+      setNoteError("Failed to save note — please try again.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   const visible = expanded ? entries : entries.slice(0, 5);
 
   return (
@@ -593,35 +521,77 @@ function TimelineSection({ entries }: { entries: AIOpsTimelineEntry[] }) {
         </div>
       </div>
 
-      <div className="relative">
-        <div className="absolute bottom-0 left-[1.85rem] top-4 w-px bg-white/[0.05]" />
-        <div className="divide-y divide-white/[0.04]">
-          {visible.map((e) => {
-            const Icon = TL_ICONS[e.kind] ?? Activity;
-            return (
-              <div key={e.id} className="flex gap-3 px-4 py-3">
-                <div className="relative z-10 mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-[#0c1220] ring-1 ring-white/[0.07]">
-                  <Icon className="h-3 w-3 text-slate-600" />
-                </div>
-                <div className="min-w-0 flex-1 pt-0.5">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <StatusBadge value={e.kind} />
-                    <span className="text-[0.81rem] font-semibold text-slate-200">{e.title}</span>
-                    <span className="ml-auto shrink-0 text-[0.65rem] text-slate-600">{fmtTime(e.created_at)}</span>
-                  </div>
-                  {e.body && <p className="mt-0.5 text-[0.76rem] leading-5 text-slate-500">{e.body}</p>}
-                </div>
-              </div>
-            );
-          })}
+      {/* Note composer */}
+      <div className="border-b border-white/[0.06] px-4 py-3">
+        <div className="flex items-start gap-2.5">
+          <div className="mt-1 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-white/[0.05] ring-1 ring-white/[0.08]">
+            <PenLine className="h-3 w-3 text-slate-500" />
+          </div>
+          <div className="flex-1 space-y-1.5">
+            <textarea
+              value={note}
+              onChange={e => setNote(e.target.value)}
+              onKeyDown={e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) handleSubmitNote(); }}
+              placeholder="Add a note… (Ctrl+Enter to save)"
+              rows={2}
+              disabled={submitting}
+              className="w-full resize-none rounded border border-white/[0.07] bg-white/[0.03] px-3 py-2 text-[0.78rem] text-slate-200 placeholder:text-slate-600 focus:border-cyan-500/30 focus:outline-none focus:ring-1 focus:ring-cyan-500/15 disabled:opacity-50"
+            />
+            <div className="flex items-center justify-between">
+              {noteError
+                ? <span className="text-[0.7rem] text-rose-400">{noteError}</span>
+                : <span className="text-[0.68rem] text-slate-700">Saved to timeline · visible on handover</span>
+              }
+              <button
+                onClick={handleSubmitNote}
+                disabled={!note.trim() || submitting}
+                className="inline-flex items-center gap-1.5 rounded border border-cyan-500/20 bg-cyan-500/[0.08] px-2.5 py-1 text-[0.72rem] text-cyan-300 transition hover:bg-cyan-500/15 disabled:cursor-not-allowed disabled:opacity-30"
+              >
+                {submitting ? <Loader2 className="h-3 w-3 animate-spin" /> : <Send className="h-3 w-3" />}
+                Save note
+              </button>
+            </div>
+          </div>
         </div>
       </div>
 
-      {entries.length > 5 && (
-        <button onClick={() => setExpanded(v => !v)}
-          className="flex w-full items-center justify-center gap-1 border-t border-white/[0.05] py-2.5 text-[0.72rem] text-slate-600 hover:text-slate-400">
-          {expanded ? <><ChevronUp className="h-3.5 w-3.5" />Show less</> : <><ChevronDown className="h-3.5 w-3.5" />{entries.length - 5} earlier events</>}
-        </button>
+      {entries.length > 0 && (
+        <>
+          <div className="relative">
+            <div className="absolute bottom-0 left-[1.85rem] top-4 w-px bg-white/[0.05]" />
+            <div className="divide-y divide-white/[0.04]">
+              {visible.map((e) => {
+                const Icon = e.kind === "engineer_note" ? PenLine : (TL_ICONS[e.kind] ?? Activity);
+                const isNote = e.kind === "engineer_note";
+                return (
+                  <div key={e.id} className={`flex gap-3 px-4 py-3 ${isNote ? "bg-amber-500/[0.03]" : ""}`}>
+                    <div className={`relative z-10 mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full ring-1 ${isNote ? "bg-amber-500/10 ring-amber-500/20" : "bg-[#0c1220] ring-white/[0.07]"}`}>
+                      <Icon className={`h-3 w-3 ${isNote ? "text-amber-400/70" : "text-slate-600"}`} />
+                    </div>
+                    <div className="min-w-0 flex-1 pt-0.5">
+                      <div className="flex flex-wrap items-center gap-2">
+                        {isNote
+                          ? <span className="rounded border border-amber-500/20 bg-amber-500/10 px-1.5 py-0.5 text-[0.6rem] font-semibold uppercase tracking-wide text-amber-400">Note</span>
+                          : <StatusBadge value={e.kind} />
+                        }
+                        <span className="text-[0.81rem] font-semibold text-slate-200">{e.title}</span>
+                        <span className="ml-auto shrink-0 text-[0.65rem] text-slate-600">{fmtTime(e.created_at)}</span>
+                      </div>
+                      {e.body && <p className={`mt-0.5 text-[0.76rem] leading-5 ${isNote ? "text-slate-300" : "text-slate-500"}`}>{e.body}</p>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {entries.length > 5 && (
+            <button onClick={() => setExpanded(v => !v)}
+              className="flex w-full items-center justify-center gap-1 border-t border-white/[0.05] py-2.5 text-[0.72rem] text-slate-600 hover:text-slate-400">
+              {expanded ? <><ChevronUp className="h-3.5 w-3.5" />Show less</> : <><ChevronDown className="h-3.5 w-3.5" />{entries.length - 5} earlier events</>}
+            </button>
+          )}
+        </>
       )}
     </div>
   );
@@ -652,7 +622,6 @@ function Sidebar({ data }: { data: AIOpsIncidentDetailPayload }) {
   ];
 
   const sections = [
-    { id: "what-to-do",   label: "What to do" },
     ...(troubleshoot ? [{ id: "investigation", label: "Investigation" }] : []),
     ...(data.proposal    ? [{ id: "remediation",   label: "Remediation Plan" }] : []),
     { id: "evidence",    label: "Syslog Evidence" },
@@ -719,7 +688,7 @@ export function IncidentDetailClient({ initialData }: { initialData: AIOpsIncide
   const incident = data.incident;
 
   const refresh = useCallback(async () => {
-    try { setData(await fetchIncidentDetail(incident.incident_no)); } catch { /* ignore */ }
+    try { setData(await fetchIncidentDetail(incident.incident_no)); } catch (_) { /* ignore — background poll, error already visible via action errors */ }
   }, [incident.incident_no]);
 
   useEffect(() => {
@@ -770,8 +739,8 @@ export function IncidentDetailClient({ initialData }: { initialData: AIOpsIncide
           </div>
         </div>
 
-        {/* Disposition summary line */}
-        {data.troubleshoot && (
+        {/* Disposition summary line — hide when incident is already resolved */}
+        {data.troubleshoot && !["resolved", "resolved_uncertain", "closed"].includes(incident.status) && (
           <div className="mt-3">
             <DispositionBanner
               disposition={data.troubleshoot.disposition}
@@ -854,11 +823,14 @@ export function IncidentDetailClient({ initialData }: { initialData: AIOpsIncide
         <div className="grid gap-5 xl:grid-cols-[1fr_300px]">
           {/* Main scroll column */}
           <div className="space-y-4 min-w-0">
-            <div id="what-to-do"><WhatToDoNext data={data} /></div>
             <InvestigationSection data={data} loading={actionLoading === "troubleshoot"} />
             <RemediationPlan data={data} withAction={withAction} actionLoading={actionLoading} />
             <SyslogSection data={data} />
-            <TimelineSection entries={data.timeline} />
+            <TimelineSection
+              entries={data.timeline}
+              incidentNo={data.incident.incident_no}
+              onNoteAdded={setData}
+            />
           </div>
           {/* Sticky sidebar */}
           <div className="hidden xl:block">

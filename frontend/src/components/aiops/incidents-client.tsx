@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useState, useCallback, useMemo } from "react";
-import { RefreshCw, Search, ChevronLeft, ChevronRight, ArrowUpDown } from "lucide-react";
+import { RefreshCw, Search, ChevronLeft, ChevronRight, ArrowUpDown, AlertCircle } from "lucide-react";
 import { ResetIncidentsButton } from "@/components/aiops/reset-incidents-button";
 import { SectionCard } from "@/components/aiops/section-card";
 import { StatusBadge } from "@/components/aiops/status-badge";
@@ -55,6 +55,7 @@ function relativeTime(iso: string) {
 export function IncidentsClient({ initialIncidents }: { initialIncidents: AIOpsIncident[] }) {
   const [incidents, setIncidents]       = useState(initialIncidents);
   const [refreshing, setRefreshing]     = useState(false);
+  const [fetchError, setFetchError]     = useState<string | null>(null);
   const [search, setSearch]             = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [severityFilter, setSeverityFilter] = useState<string>("all");
@@ -64,9 +65,12 @@ export function IncidentsClient({ initialIncidents }: { initialIncidents: AIOpsI
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
-    try { setIncidents(await fetchIncidents()); }
-    catch { /* ignore */ }
-    finally { setRefreshing(false); }
+    try {
+      setIncidents(await fetchIncidents());
+      setFetchError(null);
+    } catch (e) {
+      setFetchError(e instanceof Error ? e.message : "Failed to refresh incidents");
+    } finally { setRefreshing(false); }
   }, []);
 
   useEffect(() => {
@@ -132,6 +136,12 @@ export function IncidentsClient({ initialIncidents }: { initialIncidents: AIOpsI
         </div>
       }
     >
+      {fetchError && (
+        <div className="flex items-center gap-2 border-b border-rose-500/20 bg-rose-500/[0.06] px-4 py-2.5">
+          <AlertCircle className="h-3.5 w-3.5 shrink-0 text-rose-400" />
+          <p className="text-[0.76rem] text-rose-300">Refresh failed: {fetchError} — showing cached data</p>
+        </div>
+      )}
       {/* Filter bar */}
       <div className="grid gap-2.5 border-b border-white/[0.07] px-4 py-3 md:grid-cols-3">
         <div className="relative">

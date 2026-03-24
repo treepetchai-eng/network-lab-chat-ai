@@ -43,6 +43,7 @@ from langchain_core.messages import (
 from src.prompts.ssh_compact import SSH_COMPACT_PROMPT
 from src.prompts.ssh_synthesis import SSH_SYNTHESIS_PROMPT
 from src.tools.inventory_tools import list_all_devices, lookup_device
+from src.tools.db_tools import search_logs, search_incidents, get_incident_detail
 from src.formatters import parse_output
 
 logger = logging.getLogger(__name__)
@@ -655,7 +656,10 @@ def free_run_node(
     prior_tool_messages = list(_iter_tool_messages(messages))
     clean_msgs = _sanitize_messages(relevant_messages)
 
-    llm_with_tools = llm.bind_tools([lookup_device, list_all_devices, run_cli_tool])
+    llm_with_tools = llm.bind_tools([
+        lookup_device, list_all_devices, run_cli_tool,
+        search_logs, search_incidents, get_incident_detail,
+    ])
     loop_messages: list[BaseMessage] = [compact_system_msg] + clean_msgs
     result_messages: list[BaseMessage] = []
     executed_calls: set[tuple[str, str]] = set()
@@ -826,6 +830,15 @@ def free_run_node(
                 batch_result = run_cli_results_by_id[tc["id"]]
                 output = batch_result["output"]
                 tool_metadata = batch_result["tool_metadata"]
+            elif tc["name"] == "search_logs":
+                tool_metadata = {"tool_args": tc.get("args", {})}
+                output = search_logs.invoke(tc["args"])
+            elif tc["name"] == "search_incidents":
+                tool_metadata = {"tool_args": tc.get("args", {})}
+                output = search_incidents.invoke(tc["args"])
+            elif tc["name"] == "get_incident_detail":
+                tool_metadata = {"tool_args": tc.get("args", {})}
+                output = get_incident_detail.invoke(tc["args"])
             else:
                 tool_metadata = {"tool_args": tc.get("args", {})}
                 output = f"[ERROR] Unknown tool: {tc['name']}"

@@ -2,12 +2,15 @@
 
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import {
-  AlertCircle, ChevronRight, ChevronUp, Loader2,
-  MessageSquare, RotateCcw, Send, Server, Terminal,
+  AlertCircle, Loader2, MessageSquare, RotateCcw, Send, Server,
 } from "lucide-react";
 import { createIncidentSession, deleteSession, sendMessageStream } from "@/lib/api";
 import { parseSSELine } from "@/lib/sse-parser";
 import { SSE_EVENTS } from "@/lib/constants";
+import { AssistantMessage } from "@/components/chat/assistant-message";
+import { UserMessage } from "@/components/chat/user-message";
+import { CollapsibleStep } from "@/components/stream/collapsible-step";
+import { MarkdownRenderer } from "@/components/markdown/markdown-renderer";
 import type { AIOpsIncidentDetailPayload } from "@/lib/aiops-types";
 
 /* ─────────────────── Types ─────────────────── */
@@ -110,73 +113,34 @@ function reducer(s: State, a: Action): State {
 
 /* ─────────────────── Sub-components ─────────────────── */
 
-function CliStep({ step, index }: { step: StepItem; index: number }) {
-  const [open, setOpen] = useState(false);
-  return (
-    <div className="overflow-hidden rounded border border-white/[0.07] bg-[#060b14]">
-      <div
-        role="button" tabIndex={0}
-        onClick={() => setOpen(v => !v)}
-        onKeyDown={e => e.key === "Enter" && setOpen(v => !v)}
-        className="flex w-full cursor-pointer items-center gap-2 px-3 py-2 text-left hover:bg-white/[0.02]"
-      >
-        <span className="flex h-4.5 w-4.5 shrink-0 items-center justify-center rounded bg-white/[0.05] font-mono text-[0.6rem] font-bold text-slate-600">
-          {index + 1}
-        </span>
-        <Terminal className={`h-3 w-3 shrink-0 ${step.isError ? "text-rose-500/70" : "text-slate-700"}`} />
-        <code className={`flex-1 truncate font-mono text-[0.75rem] ${step.isError ? "text-rose-300" : "text-cyan-300"}`}>
-          {step.name}
-        </code>
-        {open ? <ChevronUp className="h-3 w-3 text-slate-700" /> : <ChevronRight className="h-3 w-3 text-slate-700" />}
-      </div>
-      {open && step.content && (
-        <div className="border-t border-white/[0.05]">
-          <pre className="max-h-48 overflow-auto px-3 py-2.5 font-mono text-[0.72rem] leading-[1.6] text-slate-300 whitespace-pre">
-            {step.content}
-          </pre>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function AssistantBubble({ msg }: { msg: ChatMsg }) {
-  return (
-    <div className="space-y-2">
-      {msg.steps.length > 0 && (
-        <div className="space-y-1">
-          {msg.steps.map((s, i) => <CliStep key={s.id} step={s} index={i} />)}
-        </div>
-      )}
-      <div className="rounded-lg border border-white/[0.06] bg-white/[0.03] px-4 py-3">
-        <p className="whitespace-pre-wrap text-[0.84rem] leading-7 text-slate-200">{msg.content}</p>
-      </div>
-    </div>
-  );
-}
-
 function StreamingBubble({ tokens, steps, status }: { tokens: string; steps: StepItem[]; status: string | null }) {
   return (
-    <div className="space-y-2">
-      {steps.length > 0 && (
-        <div className="space-y-1">
-          {steps.map((s, i) => <CliStep key={s.id} step={s} index={i} />)}
-        </div>
-      )}
-      {status && !tokens && (
-        <div className="flex items-center gap-2 text-[0.76rem] text-slate-500">
-          <Loader2 className="h-3 w-3 animate-spin text-cyan-500/70" />
-          {status}
-        </div>
-      )}
-      {tokens && (
-        <div className="rounded-lg border border-cyan-500/15 bg-white/[0.03] px-4 py-3">
-          <p className="whitespace-pre-wrap text-[0.84rem] leading-7 text-slate-200">
-            {tokens}
-            <span className="ml-0.5 inline-block h-3.5 w-0.5 animate-pulse bg-cyan-400" />
-          </p>
-        </div>
-      )}
+    <div className="flex items-start gap-2 sm:gap-3">
+      <div className="mt-1 flex h-7 w-7 sm:h-8 sm:w-8 shrink-0 items-center justify-center rounded-full border border-cyan-300/18 bg-[linear-gradient(135deg,rgba(8,42,64,0.95),rgba(12,132,176,0.82))] shadow-[0_0_18px_rgba(34,211,238,0.16)]">
+        <Loader2 className="h-3 w-3 sm:h-3.5 sm:w-3.5 animate-spin text-cyan-200" />
+      </div>
+      <div className="min-w-0 flex-1 space-y-2 sm:space-y-3">
+        <span className="text-[0.7rem] sm:text-[0.74rem] font-medium text-cyan-200/60">Network Copilot</span>
+        {steps.length > 0 && (
+          <div className="rounded-2xl sm:rounded-[20px] border border-white/10 bg-[linear-gradient(180deg,rgba(9,16,27,0.72),rgba(8,13,23,0.58))] p-1 sm:p-1.5 shadow-[0_12px_34px_rgba(2,7,18,0.16)]">
+            {steps.map((s) => (
+              <CollapsibleStep key={s.id} step={s} />
+            ))}
+          </div>
+        )}
+        {status && !tokens && (
+          <div className="flex items-center gap-2 text-[0.76rem] text-slate-500">
+            <Loader2 className="h-3 w-3 animate-spin text-cyan-500/70" />
+            {status}
+          </div>
+        )}
+        {tokens && (
+          <div className="ui-copy text-slate-200">
+            <MarkdownRenderer content={tokens} />
+            <span className="ml-0.5 inline-block h-3.5 w-0.5 animate-pulse bg-cyan-400 align-middle" />
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -362,7 +326,7 @@ export function IncidentChat({ data }: { data: AIOpsIncidentDetailPayload }) {
       <ContextBanner data={data} />
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
+      <div className="incident-chat flex-1 overflow-y-auto px-4 py-4 space-y-4">
         {isEmpty && (
           <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
             <MessageSquare className="h-7 w-7 text-slate-700" />
@@ -392,13 +356,11 @@ export function IncidentChat({ data }: { data: AIOpsIncidentDetailPayload }) {
         )}
 
         {messages.map(msg => (
-          <div key={msg.id} className={msg.role === "user" ? "flex justify-end" : ""}>
+          <div key={msg.id}>
             {msg.role === "user" ? (
-              <div className="max-w-[80%] rounded-lg bg-cyan-500/[0.1] border border-cyan-500/20 px-4 py-2.5">
-                <p className="text-[0.84rem] leading-6 text-slate-200">{msg.content}</p>
-              </div>
+              <UserMessage content={msg.content} />
             ) : (
-              <AssistantBubble msg={msg} />
+              <AssistantMessage message={{ ...msg, timestamp: 0 }} />
             )}
           </div>
         ))}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import os
 import queue
@@ -293,6 +294,53 @@ class AIOpsService:
             raw_response TEXT NOT NULL DEFAULT '',
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+
+        CREATE TABLE IF NOT EXISTS device_vuln_scans (
+            id BIGSERIAL PRIMARY KEY,
+            device_id BIGINT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+            ios_version TEXT NOT NULL,
+            advisory_count INTEGER NOT NULL DEFAULT 0,
+            critical_count INTEGER NOT NULL DEFAULT 0,
+            high_count INTEGER NOT NULL DEFAULT 0,
+            medium_count INTEGER NOT NULL DEFAULT 0,
+            low_count INTEGER NOT NULL DEFAULT 0,
+            llm_summary TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'completed',
+            error_message TEXT,
+            scanned_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS device_vulnerabilities (
+            id BIGSERIAL PRIMARY KEY,
+            device_id BIGINT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+            scan_id BIGINT NOT NULL REFERENCES device_vuln_scans(id) ON DELETE CASCADE,
+            advisory_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            sir TEXT NOT NULL,
+            cvss_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+            cves JSONB NOT NULL DEFAULT '[]'::jsonb,
+            publication_url TEXT NOT NULL DEFAULT '',
+            summary TEXT NOT NULL DEFAULT '',
+            workaround TEXT NOT NULL DEFAULT '',
+            first_fixed JSONB NOT NULL DEFAULT '[]'::jsonb,
+            first_published TIMESTAMPTZ,
+            last_updated TIMESTAMPTZ,
+            UNIQUE (scan_id, advisory_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS advisory_checks (
+            id BIGSERIAL PRIMARY KEY,
+            device_id BIGINT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+            advisory_id TEXT NOT NULL,
+            advisory_title TEXT NOT NULL DEFAULT '',
+            verdict TEXT NOT NULL DEFAULT 'pending',
+            confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+            explanation TEXT NOT NULL DEFAULT '',
+            commands_run JSONB NOT NULL DEFAULT '[]'::jsonb,
+            llm_model TEXT NOT NULL DEFAULT '',
+            checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
         """
         with connect() as conn:
             with conn.cursor() as cur:
@@ -312,6 +360,9 @@ class AIOpsService:
                     ("candidate_groups", "last_decision_event_count",   "INTEGER NOT NULL DEFAULT 0"),
                     ("proposals",        "rollback_commands",           "JSONB NOT NULL DEFAULT '[]'::jsonb"),
                     ("proposals",        "cancelled_reason",            "TEXT"),
+                    ("device_vuln_scans",      "scan_source",    "TEXT NOT NULL DEFAULT 'unknown'"),
+                    ("device_vulnerabilities", "first_published", "TIMESTAMPTZ"),
+                    ("device_vulnerabilities", "last_updated",    "TIMESTAMPTZ"),
                 ]
                 cur.execute(
                     """
@@ -1751,22 +1802,52 @@ class AIOpsService:
                 )
                 return cur.fetchall()
 
-    def logs(self, incident_no: str | None = None, limit: int = 200) -> dict[str, Any]:
+    def logs(
+        self,
+        incident_no: str | None = None,
+        limit: int = 200,
+        device: str | None = None,
+        hours_back: int | None = None,
+        keyword: str | None = None,
+    ) -> dict[str, Any]:
         with connect() as conn:
             with conn.cursor() as cur:
-                if incident_no:
+                # Resolve device hostname → IP
+                device_ip: str | None = None
+                if device:
                     cur.execute(
-                        """
+                        "SELECT ip_address FROM devices WHERE lower(hostname) = lower(%s) OR ip_address = %s LIMIT 1",
+                        (device, device),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        device_ip = row["ip_address"]
+
+                if incident_no:
+                    conditions = ["i.incident_no = %s"]
+                    params: list = [incident_no]
+                    if device_ip:
+                        conditions.append("rl.source_ip = %s")
+                        params.append(device_ip)
+                    if hours_back:
+                        conditions.append("rl.received_at >= NOW() - (%s || ' hours')::interval")
+                        params.append(str(hours_back))
+                    if keyword:
+                        conditions.append("rl.raw_message ILIKE %s")
+                        params.append(f"%{keyword}%")
+                    where = " AND ".join(conditions)
+                    cur.execute(
+                        f"""
                         SELECT rl.*, i.incident_no
                         FROM raw_logs rl
                         JOIN events e ON e.raw_log_id = rl.id
                         JOIN incident_events ie ON ie.event_id = e.id
                         JOIN incidents i ON i.id = ie.incident_id
-                        WHERE i.incident_no = %s
+                        WHERE {where}
                         ORDER BY rl.received_at DESC
                         LIMIT %s
                         """,
-                        (incident_no, limit),
+                        params + [limit],
                     )
                     raw_logs = cur.fetchall()
                     cur.execute(
@@ -1784,8 +1865,20 @@ class AIOpsService:
                     )
                     events = cur.fetchall()
                 else:
+                    conditions = []
+                    params = []
+                    if device_ip:
+                        conditions.append("rl.source_ip = %s")
+                        params.append(device_ip)
+                    if hours_back:
+                        conditions.append("rl.received_at >= NOW() - (%s || ' hours')::interval")
+                        params.append(str(hours_back))
+                    if keyword:
+                        conditions.append("rl.raw_message ILIKE %s")
+                        params.append(f"%{keyword}%")
+                    extra_where = ("AND " + " AND ".join(conditions)) if conditions else ""
                     cur.execute(
-                        """
+                        f"""
                         SELECT * FROM (
                             SELECT
                                 rl.*,
@@ -1795,16 +1888,27 @@ class AIOpsService:
                             LEFT JOIN events e ON e.raw_log_id = rl.id
                             LEFT JOIN incident_events ie ON ie.event_id = e.id
                             LEFT JOIN incidents i ON i.id = ie.incident_id
+                            WHERE 1=1 {extra_where}
                         ) dedup
                         WHERE row_rank = 1
                         ORDER BY received_at DESC
                         LIMIT %s
                         """,
-                        (limit,),
+                        params + [limit],
                     )
                     raw_logs = cur.fetchall()
+                    # Events: apply device/time filters too
+                    ev_conditions = []
+                    ev_params: list = []
+                    if device_ip:
+                        ev_conditions.append("d.ip_address = %s")
+                        ev_params.append(device_ip)
+                    if hours_back:
+                        ev_conditions.append("e.created_at >= NOW() - (%s || ' hours')::interval")
+                        ev_params.append(str(hours_back))
+                    ev_extra = ("AND " + " AND ".join(ev_conditions)) if ev_conditions else ""
                     cur.execute(
-                        """
+                        f"""
                         SELECT * FROM (
                             SELECT
                                 e.*,
@@ -1815,12 +1919,13 @@ class AIOpsService:
                             LEFT JOIN devices d ON d.id = e.device_id
                             LEFT JOIN incident_events ie ON ie.event_id = e.id
                             LEFT JOIN incidents i ON i.id = ie.incident_id
+                            WHERE 1=1 {ev_extra}
                         ) dedup
                         WHERE row_rank = 1
                         ORDER BY created_at DESC
                         LIMIT %s
                         """,
-                        (limit,),
+                        ev_params + [limit],
                     )
                     events = cur.fetchall()
         return {"raw_logs": raw_logs, "events": events}
@@ -1888,6 +1993,346 @@ class AIOpsService:
                     "events": events,
                 }
 
+    # ── Vulnerability scanning ────────────────────────────────────────────────
+
+    def get_device_check_summary(self, hostname: str) -> dict[str, Any]:
+        """Return aggregated impact-check verdicts for a device (latest check per advisory)."""
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT verdict, COUNT(*) AS cnt
+                    FROM (
+                        SELECT DISTINCT ON (ac.advisory_id) ac.verdict
+                        FROM advisory_checks ac
+                        JOIN devices d ON d.id = ac.device_id
+                        WHERE LOWER(d.hostname) = LOWER(%s) OR d.ip_address = %s
+                        ORDER BY ac.advisory_id, ac.checked_at DESC
+                    ) sub
+                    GROUP BY verdict
+                    """,
+                    (hostname, hostname),
+                )
+                rows = cur.fetchall()
+        counts: dict[str, int] = {"affected": 0, "not_affected": 0, "uncertain": 0}
+        for row in rows:
+            v = row["verdict"]
+            if v in counts:
+                counts[v] += int(row["cnt"])
+        return {
+            "checked": sum(counts.values()),
+            "affected": counts["affected"],
+            "not_affected": counts["not_affected"],
+            "uncertain": counts["uncertain"],
+        }
+
+    def get_vulnerability_summary(self) -> dict[str, Any]:
+        """Return vulnerability summary across all devices with their latest scan results."""
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        d.id, d.hostname, d.ip_address, d.os_platform,
+                        d.device_role, d.site, d.version,
+                        s.id          AS scan_id,
+                        s.ios_version,
+                        s.advisory_count,
+                        s.critical_count,
+                        s.high_count,
+                        s.medium_count,
+                        s.low_count,
+                        s.llm_summary,
+                        s.status      AS scan_status,
+                        s.error_message,
+                        s.scanned_at,
+                        chk.check_affected,
+                        chk.check_not_affected,
+                        chk.check_uncertain
+                    FROM devices d
+                    LEFT JOIN LATERAL (
+                        SELECT * FROM device_vuln_scans
+                        WHERE device_id = d.id
+                        ORDER BY scanned_at DESC
+                        LIMIT 1
+                    ) s ON TRUE
+                    LEFT JOIN LATERAL (
+                        SELECT
+                            COUNT(*) FILTER (WHERE verdict = 'affected')     AS check_affected,
+                            COUNT(*) FILTER (WHERE verdict = 'not_affected') AS check_not_affected,
+                            COUNT(*) FILTER (WHERE verdict = 'uncertain')    AS check_uncertain
+                        FROM (
+                            SELECT DISTINCT ON (advisory_id) verdict
+                            FROM advisory_checks
+                            WHERE device_id = d.id
+                            ORDER BY advisory_id, checked_at DESC
+                        ) latest
+                    ) chk ON TRUE
+                    ORDER BY
+                        COALESCE(s.critical_count, -1) DESC,
+                        COALESCE(s.high_count,     -1) DESC,
+                        d.hostname
+                    """
+                )
+                devices = cur.fetchall()
+
+        scanned = [d for d in devices if d["scan_id"] is not None]
+        return {
+            "summary": {
+                "total_devices":        len(devices),
+                "scanned_devices":      len(scanned),
+                "unscanned_devices":    len(devices) - len(scanned),
+                "devices_with_critical": sum(1 for d in scanned if (d["critical_count"] or 0) > 0),
+                "devices_with_high":    sum(1 for d in scanned if (d["high_count"] or 0) > 0),
+                "total_critical":       sum(d["critical_count"] or 0 for d in scanned),
+                "total_high":           sum(d["high_count"]     or 0 for d in scanned),
+                "total_medium":         sum(d["medium_count"]   or 0 for d in scanned),
+                "total_low":            sum(d["low_count"]      or 0 for d in scanned),
+                "total_advisories":     sum(d["advisory_count"] or 0 for d in scanned),
+            },
+            "devices": devices,
+        }
+
+    def run_vuln_scan_all(self) -> dict[str, Any]:
+        """Scan all devices against Cisco PSIRT. Skips devices scanned in last 12 hours."""
+        from datetime import timezone
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT hostname FROM devices ORDER BY hostname")
+                all_devices = [r["hostname"] for r in cur.fetchall()]
+
+                # Find devices with a recent scan (< 12 h old)
+                cur.execute(
+                    """
+                    SELECT DISTINCT d.hostname
+                    FROM devices d
+                    JOIN device_vuln_scans s ON s.device_id = d.id
+                    WHERE s.scanned_at > NOW() - INTERVAL '12 hours'
+                    """
+                )
+                recent = {r["hostname"] for r in cur.fetchall()}
+
+        to_scan = [h for h in all_devices if h not in recent]
+        skipped = list(recent)
+        scanned: list[str] = []
+        errors: list[dict] = []
+
+        for hostname in to_scan:
+            try:
+                self.run_vuln_scan(hostname)
+                scanned.append(hostname)
+            except Exception as exc:
+                logger.error("Vuln scan failed for %s: %s", hostname, exc)
+                errors.append({"hostname": hostname, "error": str(exc)})
+
+        return {
+            "scanned": scanned,
+            "skipped": skipped,
+            "errors":  errors,
+        }
+
+    def get_device_vulnerabilities(self, hostname: str) -> dict[str, Any] | None:
+        """Return the latest vuln scan result + advisory list for a device."""
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, ip_address, version FROM devices WHERE LOWER(hostname) = LOWER(%s) OR ip_address = %s",
+                    (hostname, hostname),
+                )
+                device = cur.fetchone()
+                if not device:
+                    return None
+
+                cur.execute(
+                    """
+                    SELECT * FROM device_vuln_scans
+                    WHERE device_id = %s
+                    ORDER BY scanned_at DESC
+                    LIMIT 1
+                    """,
+                    (device["id"],),
+                )
+                scan = cur.fetchone()
+                if not scan:
+                    return {"device_id": device["id"], "scan": None, "advisories": []}
+
+                cur.execute(
+                    """
+                    SELECT * FROM device_vulnerabilities
+                    WHERE scan_id = %s
+                    ORDER BY
+                        first_published DESC NULLS LAST,
+                        CASE sir
+                            WHEN 'Critical' THEN 4
+                            WHEN 'High'     THEN 3
+                            WHEN 'Medium'   THEN 2
+                            WHEN 'Low'      THEN 1
+                            ELSE 0
+                        END DESC,
+                        cvss_score DESC
+                    """,
+                    (scan["id"],),
+                )
+                advisories = cur.fetchall()
+                return {"device_id": device["id"], "scan": scan, "advisories": advisories}
+
+    def run_vuln_scan(self, hostname: str) -> dict[str, Any]:
+        """Trigger a fresh vulnerability scan (PSIRT → NVD fallback). Blocks until complete."""
+        from src.aiops.vuln_scanner import fetch_advisories_for_version, generate_vuln_summary
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM devices WHERE LOWER(hostname) = LOWER(%s) OR ip_address = %s",
+                    (hostname, hostname),
+                )
+                device = cur.fetchone()
+                if not device:
+                    raise KeyError(f"Device not found: {hostname!r}")
+
+        ios_version = device.get("version", "") or ""
+        error_message: str | None = None
+        advisories = []
+        scan_source = "none"
+        status = "completed"
+
+        try:
+            advisories, scan_source = fetch_advisories_for_version(
+                ios_version, os_platform=device.get("os_platform", "cisco_ios") or "cisco_ios"
+            )
+        except Exception as exc:
+            logger.error("Vuln fetch failed for %s: %s", hostname, exc)
+            error_message = str(exc)
+            status = "error"
+
+        llm_summary = generate_vuln_summary(dict(device), advisories, scan_source)
+
+        counts = {
+            "advisory_count": len(advisories),
+            "critical_count": sum(1 for a in advisories if a.sir == "Critical"),
+            "high_count":     sum(1 for a in advisories if a.sir == "High"),
+            "medium_count":   sum(1 for a in advisories if a.sir == "Medium"),
+            "low_count":      sum(1 for a in advisories if a.sir == "Low"),
+        }
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO device_vuln_scans
+                        (device_id, ios_version, advisory_count, critical_count, high_count,
+                         medium_count, low_count, llm_summary, status, error_message, scan_source)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                    """,
+                    (
+                        device["id"], ios_version,
+                        counts["advisory_count"], counts["critical_count"],
+                        counts["high_count"], counts["medium_count"], counts["low_count"],
+                        llm_summary, status, error_message, scan_source,
+                    ),
+                )
+                scan_id = cur.fetchone()["id"]
+
+                for adv in advisories:
+                    fp = adv.first_published or None
+                    lu = adv.last_updated or None
+                    cur.execute(
+                        """
+                        INSERT INTO device_vulnerabilities
+                            (device_id, scan_id, advisory_id, title, sir, cvss_score,
+                             cves, publication_url, summary, workaround, first_fixed,
+                             first_published, last_updated)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s)
+                        ON CONFLICT (scan_id, advisory_id) DO NOTHING
+                        """,
+                        (
+                            device["id"], scan_id,
+                            adv.advisory_id, adv.title, adv.sir, adv.cvss_score,
+                            Json(adv.cves), adv.publication_url,
+                            adv.summary, adv.workaround, Json(adv.first_fixed),
+                            fp, lu,
+                        ),
+                    )
+                conn.commit()
+
+        return self.get_device_vulnerabilities(hostname) or {}
+
+    def get_advisory_checks(self, hostname: str, advisory_id: str) -> list[dict[str, Any]]:
+        """Return past impact checks for a device + advisory, newest first."""
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT ac.*
+                    FROM advisory_checks ac
+                    JOIN devices d ON d.id = ac.device_id
+                    WHERE (LOWER(d.hostname) = LOWER(%s) OR d.ip_address = %s)
+                      AND ac.advisory_id = %s
+                    ORDER BY ac.checked_at DESC
+                    LIMIT 10
+                    """,
+                    (hostname, hostname, advisory_id),
+                )
+                rows = cur.fetchall()
+        result = []
+        for row in rows:
+            r = dict(row)
+            cmds = r.get("commands_run")
+            if isinstance(cmds, str):
+                try:
+                    r["commands_run"] = json.loads(cmds)
+                except Exception:
+                    r["commands_run"] = []
+            result.append(r)
+        return result
+
+    def save_advisory_check(
+        self,
+        hostname: str,
+        advisory_id: str,
+        advisory_title: str,
+        verdict: str,
+        confidence: float,
+        explanation: str,
+        commands_run: list[dict[str, str]],
+        llm_model: str = "",
+    ) -> dict[str, Any]:
+        """Persist an advisory impact check result and return the saved row."""
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM devices WHERE LOWER(hostname) = LOWER(%s) OR ip_address = %s",
+                    (hostname, hostname),
+                )
+                device = cur.fetchone()
+                if not device:
+                    raise KeyError(f"Device not found: {hostname!r}")
+                cur.execute(
+                    """
+                    INSERT INTO advisory_checks
+                        (device_id, advisory_id, advisory_title, verdict, confidence,
+                         explanation, commands_run, llm_model)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                    RETURNING *
+                    """,
+                    (
+                        device["id"], advisory_id, advisory_title, verdict,
+                        confidence, explanation,
+                        Json(commands_run), llm_model,
+                    ),
+                )
+                row = dict(cur.fetchone())
+            conn.commit()
+        cmds = row.get("commands_run")
+        if isinstance(cmds, str):
+            try:
+                row["commands_run"] = json.loads(cmds)
+            except Exception:
+                row["commands_run"] = []
+        return row
+
     def approvals(self, limit: int = 100) -> list[dict[str, Any]]:
         with connect() as conn:
             with conn.cursor() as cur:
@@ -1937,6 +2382,26 @@ class AIOpsService:
             "events_removed": event_count,
             "raw_logs_removed": raw_log_count,
         }
+
+    def add_incident_note(self, incident_no: str, author: str, body: str) -> None:
+        """Insert an engineer note into the incident timeline."""
+        if not body.strip():
+            raise ValueError("Note body cannot be empty")
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM incidents WHERE incident_no = %s", (incident_no,))
+                row = cur.fetchone()
+                if row is None:
+                    raise KeyError(f"Incident {incident_no} not found")
+                self._append_timeline(
+                    cur,
+                    incident_id=row["id"],
+                    kind="engineer_note",
+                    title=f"Note by {author or 'engineer'}",
+                    body=body.strip(),
+                    payload={"author": author or "engineer"},
+                )
+            conn.commit()
 
     def get_incident(self, incident_no: str) -> dict[str, Any]:
         with connect() as conn:

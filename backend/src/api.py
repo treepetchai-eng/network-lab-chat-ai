@@ -344,10 +344,38 @@ async def aiops_incident_detail_endpoint(incident_no: str):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.get("/api/aiops/logs")
-async def aiops_logs_endpoint(incident_no: str | None = None, limit: int = 200):
+@app.post("/api/aiops/incidents/{incident_no}/notes")
+async def aiops_add_note_endpoint(incident_no: str, body: dict):
     _ensure_aiops_ready()
-    return _aiops_service.logs(incident_no=incident_no, limit=max(1, min(limit, 500)))
+    try:
+        _aiops_service.add_incident_note(
+            incident_no=incident_no,
+            author=str(body.get("author", "engineer")),
+            body=str(body.get("body", "")),
+        )
+        return _aiops_service.get_incident(incident_no)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/aiops/logs")
+async def aiops_logs_endpoint(
+    incident_no: str | None = None,
+    limit: int = 200,
+    device: str | None = None,
+    hours_back: int | None = None,
+    keyword: str | None = None,
+):
+    _ensure_aiops_ready()
+    return _aiops_service.logs(
+        incident_no=incident_no,
+        limit=max(1, min(limit, 500)),
+        device=device or None,
+        hours_back=min(hours_back, 168) if hours_back else None,
+        keyword=keyword or None,
+    )
 
 
 @app.get("/api/aiops/approvals")
@@ -370,6 +398,127 @@ async def aiops_device_detail_endpoint(hostname: str):
         from fastapi.responses import JSONResponse
         return JSONResponse(status_code=404, content={"error": "Device not found"})
     return result
+
+
+@app.get("/api/aiops/vulnerabilities")
+async def aiops_vuln_summary_endpoint():
+    _ensure_aiops_ready()
+    return _aiops_service.get_vulnerability_summary()
+
+
+@app.post("/api/aiops/vulnerabilities/scan-all")
+async def aiops_vuln_scan_all_endpoint():
+    _ensure_aiops_ready()
+    try:
+        return await asyncio.to_thread(_aiops_service.run_vuln_scan_all)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Scan-all failed: {exc}") from exc
+
+
+@app.get("/api/aiops/devices/{hostname}/vulnerabilities")
+async def aiops_device_vuln_endpoint(hostname: str):
+    _ensure_aiops_ready()
+    result = _aiops_service.get_device_vulnerabilities(hostname)
+    if result is None:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=404, content={"error": "Device not found"})
+    return result
+
+
+@app.post("/api/aiops/devices/{hostname}/vulnerabilities/scan")
+async def aiops_device_vuln_scan_endpoint(hostname: str):
+    _ensure_aiops_ready()
+    try:
+        return await asyncio.to_thread(_aiops_service.run_vuln_scan, hostname)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Scan failed: {exc}") from exc
+
+
+@app.get("/api/aiops/devices/{hostname}/vulnerabilities/check-summary")
+async def aiops_device_check_summary_endpoint(hostname: str):
+    """Aggregated impact-check verdict counts for a device."""
+    _ensure_aiops_ready()
+    return _aiops_service.get_device_check_summary(hostname)
+
+
+@app.get("/api/aiops/devices/{hostname}/vulnerabilities/{advisory_id}/checks")
+async def aiops_advisory_checks_endpoint(hostname: str, advisory_id: str):
+    """Return past advisory impact check results for a device+advisory."""
+    _ensure_aiops_ready()
+    return _aiops_service.get_advisory_checks(hostname, advisory_id)
+
+
+@app.get("/api/aiops/devices/{hostname}/vulnerabilities/{advisory_id}/check")
+async def aiops_advisory_check_sse_endpoint(hostname: str, advisory_id: str):
+    """Stream an LLM+SSH advisory impact check via Server-Sent Events."""
+    _ensure_aiops_ready()
+
+    # Resolve device info upfront (fast, sync)
+    try:
+        vuln_data = _aiops_service.get_device_vulnerabilities(hostname)
+    except Exception:
+        vuln_data = None
+    if not vuln_data:
+        raise HTTPException(status_code=404, detail=f"Device not found: {hostname!r}")
+
+    device_result = _aiops_service.device_detail(hostname)
+    if not device_result:
+        raise HTTPException(status_code=404, detail=f"Device not found: {hostname!r}")
+    device = dict(device_result.get("device", {}))
+
+    # Find the advisory in scan results
+    advisories = vuln_data.get("advisories") or []
+    advisory = next((a for a in advisories if a.get("advisory_id") == advisory_id), None)
+    if not advisory:
+        raise HTTPException(status_code=404, detail=f"Advisory {advisory_id!r} not in latest scan for {hostname!r}")
+    advisory = dict(advisory)
+
+    import queue as _queue
+    evt_queue: _queue.Queue = _queue.Queue()
+    _SENTINEL = object()
+
+    def _run_check():
+        from src.aiops.advisory_checker import check_advisory_impact
+        def _push(evt: dict):
+            evt_queue.put(evt)
+
+        result = check_advisory_impact(device=device, advisory=advisory, on_event=_push)
+
+        # Persist to DB
+        try:
+            _aiops_service.save_advisory_check(
+                hostname=hostname,
+                advisory_id=advisory_id,
+                advisory_title=advisory.get("title", ""),
+                verdict=result["verdict"],
+                confidence=result["confidence"],
+                explanation=result["explanation"],
+                commands_run=result["commands_run"],
+                llm_model=os.getenv("LLM_MODEL", ""),
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist advisory check: %s", exc)
+
+        evt_queue.put(_SENTINEL)
+
+    import threading as _threading
+    _threading.Thread(target=_run_check, daemon=True).start()
+
+    async def _event_gen():
+        loop = asyncio.get_event_loop()
+        while True:
+            evt = await loop.run_in_executor(None, evt_queue.get)
+            if evt is _SENTINEL:
+                yield {"event": "done", "data": "{}"}
+                break
+            yield {
+                "event": evt.get("type", "event"),
+                "data": json.dumps({k: v for k, v in evt.items() if k != "type"}, ensure_ascii=False),
+            }
+
+    return EventSourceResponse(_event_gen())
 
 
 @app.get("/api/aiops/history")

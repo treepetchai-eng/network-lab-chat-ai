@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useEffect, useState, useCallback } from "react";
 import {
   Activity,
+  AlertCircle,
   CheckCircle2,
   ClipboardList,
   RefreshCw,
@@ -48,6 +49,7 @@ export function DashboardClient({ initialDashboard, initialLogs }: Props) {
   const [lastRefresh, setLastRefresh] = useState<number | null>(null);
   useEffect(() => { setLastRefresh(Date.now()); }, []);
   const [refreshing, setRefreshing]   = useState(false);
+  const [fetchError, setFetchError]   = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -57,7 +59,9 @@ export function DashboardClient({ initialDashboard, initialLogs }: Props) {
       setApprovals(d.approvals);
       setLogs(l);
       setLastRefresh(Date.now());
-    } catch { /* ignore */ } finally {
+    } catch (e) {
+      setFetchError(e instanceof Error ? e.message : "Refresh failed");
+    } finally {
       setRefreshing(false);
     }
   }, []);
@@ -71,6 +75,12 @@ export function DashboardClient({ initialDashboard, initialLogs }: Props) {
 
   return (
     <div className="space-y-5">
+      {fetchError && (
+        <div className="flex items-center gap-2 rounded-lg border border-rose-500/20 bg-rose-500/[0.06] px-4 py-2.5">
+          <AlertCircle className="h-3.5 w-3.5 shrink-0 text-rose-400" />
+          <p className="text-[0.76rem] text-rose-300">Refresh failed: {fetchError} — showing cached data</p>
+        </div>
+      )}
       {/* Incident Lifecycle Banner */}
       <div className="overflow-hidden rounded-xl border border-white/8 bg-white/[0.02] px-5 py-3.5">
         <p className="mb-2.5 text-[0.65rem] font-semibold uppercase tracking-widest text-slate-600">Incident Lifecycle</p>

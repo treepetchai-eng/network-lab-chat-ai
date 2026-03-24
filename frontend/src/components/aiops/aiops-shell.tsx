@@ -9,6 +9,7 @@ import {
   FileText,
   MessageSquare,
   Router,
+  ShieldAlert,
   Wifi,
 } from "lucide-react";
 import { type ReactNode, Suspense } from "react";
@@ -26,8 +27,9 @@ const PRIMARY_NAV = [
 ] as const;
 
 const TOOLS_NAV = [
-  { href: "/aiops/logs",    label: "Logs",    icon: FileText },
-  { href: "/aiops/devices", label: "Devices", icon: Router },
+  { href: "/aiops/logs",             label: "Logs",            icon: FileText },
+  { href: "/aiops/devices",          label: "Devices",         icon: Router },
+  { href: "/aiops/vulnerabilities",  label: "Vulnerabilities", icon: ShieldAlert },
 ] as const;
 
 /* ── Live counts from dashboard API ────────────────────────────────────── */
@@ -43,7 +45,7 @@ function useLiveCounts(): Counts {
           active_incidents:  d.metrics?.active_incidents  ?? 0,
           pending_approvals: d.metrics?.pending_approvals ?? 0,
         });
-      } catch { /* ignore */ }
+      } catch (_) { /* counts stay at previous value */ }
     };
     load();
     const id = setInterval(load, 30_000);

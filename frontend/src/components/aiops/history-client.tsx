@@ -55,8 +55,16 @@ export function HistoryClient({ initialHistory }: { initialHistory: AIOpsInciden
                     </td>
                     <td className="px-4 py-3"><StatusBadge value={inc.severity} showDot /></td>
                     <td className="px-4 py-3 font-mono text-[0.77rem] text-slate-400">{inc.primary_hostname ?? inc.primary_source_ip}</td>
-                    <td className="px-4 py-3">
-                      <span className="text-[0.77rem] text-slate-400">{inc.resolution_type?.replaceAll("_", " ") ?? "—"}</span>
+                    <td className="max-w-[18rem] px-4 py-3">
+                      {inc.resolution_type && (
+                        <span className="inline-block rounded border border-white/8 bg-white/[0.03] px-1.5 py-0.5 text-[0.68rem] font-medium text-slate-400">
+                          {inc.resolution_type.replaceAll("_", " ")}
+                        </span>
+                      )}
+                      {inc.summary && (
+                        <p className="mt-1 line-clamp-2 text-[0.72rem] leading-relaxed text-slate-500">{inc.summary}</p>
+                      )}
+                      {!inc.resolution_type && !inc.summary && <span className="text-[0.77rem] text-slate-600">—</span>}
                     </td>
                     <td className="px-4 py-3 text-[0.77rem] text-slate-500">
                       {duration(inc.opened_at, inc.resolved_at) ?? "—"}

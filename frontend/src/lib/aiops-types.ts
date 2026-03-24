@@ -161,3 +161,102 @@ export interface AIOpsDeviceDetailPayload {
   incidents: AIOpsIncident[];
   events: AIOpsEvent[];
 }
+
+export interface AIOpsAdvisory {
+  id: number;
+  advisory_id: string;
+  title: string;
+  sir: "Critical" | "High" | "Medium" | "Low" | "Informational";
+  cvss_score: number;
+  cves: string[];
+  publication_url: string;
+  summary: string;
+  workaround: string;
+  first_fixed: string[];
+  first_published?: string | null;
+  last_updated?: string | null;
+}
+
+export interface AIOpsVulnScan {
+  id: number;
+  device_id: number;
+  ios_version: string;
+  advisory_count: number;
+  critical_count: number;
+  high_count: number;
+  medium_count: number;
+  low_count: number;
+  llm_summary: string;
+  status: "completed" | "error";
+  error_message?: string | null;
+  scan_source?: string | null;   // "PSIRT" | "NVD" | "none"
+  scanned_at: string;
+}
+
+export interface AIOpsDeviceVulnPayload {
+  device_id: number;
+  scan: AIOpsVulnScan | null;
+  advisories: AIOpsAdvisory[];
+}
+
+export interface AIOpsVulnSummaryMetrics {
+  total_devices: number;
+  scanned_devices: number;
+  unscanned_devices: number;
+  devices_with_critical: number;
+  devices_with_high: number;
+  total_critical: number;
+  total_high: number;
+  total_medium: number;
+  total_low: number;
+  total_advisories: number;
+}
+
+export interface AIOpsDeviceVulnRow {
+  id: number;
+  hostname: string;
+  ip_address: string;
+  os_platform: string;
+  device_role: string;
+  site: string;
+  version: string;
+  scan_id?: number | null;
+  ios_version?: string | null;
+  advisory_count?: number | null;
+  critical_count?: number | null;
+  high_count?: number | null;
+  medium_count?: number | null;
+  low_count?: number | null;
+  llm_summary?: string | null;
+  scan_status?: string | null;
+  error_message?: string | null;
+  scanned_at?: string | null;
+  check_affected?: number | null;
+  check_not_affected?: number | null;
+  check_uncertain?: number | null;
+}
+
+export interface AIOpsCheckSummary {
+  checked: number;
+  affected: number;
+  not_affected: number;
+  uncertain: number;
+}
+
+export interface AIOpsVulnSummaryPayload {
+  summary: AIOpsVulnSummaryMetrics;
+  devices: AIOpsDeviceVulnRow[];
+}
+
+export interface AIOpsAdvisoryCheck {
+  id: number;
+  device_id: number;
+  advisory_id: string;
+  advisory_title: string;
+  verdict: "affected" | "not_affected" | "uncertain" | "pending" | "error";
+  confidence: number;
+  explanation: string;
+  commands_run: Array<{ command: string; output: string }>;
+  llm_model: string;
+  checked_at: string;
+}
