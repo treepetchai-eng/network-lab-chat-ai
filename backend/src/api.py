@@ -408,11 +408,25 @@ async def aiops_vuln_summary_endpoint():
 
 @app.post("/api/aiops/vulnerabilities/scan-all")
 async def aiops_vuln_scan_all_endpoint():
+    """Fire-and-forget: start scan in background, return immediately."""
     _ensure_aiops_ready()
+    import threading as _threading
+
+    # Count devices to scan so frontend knows something started
     try:
-        return await asyncio.to_thread(_aiops_service.run_vuln_scan_all)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Scan-all failed: {exc}") from exc
+        summary = _aiops_service.get_vulnerability_summary()
+        total = summary.get("summary", {}).get("total_devices", 0)
+    except Exception:
+        total = 0
+
+    def _run():
+        try:
+            _aiops_service.run_vuln_scan_all()
+        except Exception as exc:
+            logger.error("Background scan-all failed: %s", exc)
+
+    _threading.Thread(target=_run, daemon=True).start()
+    return {"started": True, "device_count": total, "message": f"Scanning {total} device(s) in background"}
 
 
 @app.get("/api/aiops/devices/{hostname}/vulnerabilities")

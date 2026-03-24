@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import Link from "next/link";
 import {
   AlertTriangle,
@@ -104,9 +104,29 @@ export function VulnerabilitiesClient({ initialData, initialError }: Props) {
   const [scanning, setScanning] = useState<"idle" | "all" | Set<string>>("idle");
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<"all" | "critical" | "high" | "unscanned">("all");
+  // Track "scan all" polling: how many devices remain + poll interval ref
+  const [scanProgress, setScanProgress] = useState<{ total: number; scannedBefore: number } | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const summary = data?.summary;
   const devices = data?.devices ?? [];
+
+  /* ── stop polling when scan is done ─────────────────────────────────── */
+  useEffect(() => {
+    if (!scanProgress) return;
+    const scannedNow = data?.summary?.scanned_devices ?? 0;
+    if (scannedNow >= scanProgress.total || scannedNow > scanProgress.scannedBefore) {
+      // At least one device finished — keep polling until all done
+      if (scannedNow >= scanProgress.total) {
+        if (pollRef.current) clearInterval(pollRef.current);
+        pollRef.current = null;
+        setScanProgress(null);
+        setScanning("idle");
+      }
+    }
+  }, [data, scanProgress]);
+
+  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
 
   /* ── filtered devices ────────────────────────────────────────────────── */
   const filtered = useMemo(() => {
@@ -134,14 +154,23 @@ export function VulnerabilitiesClient({ initialData, initialError }: Props) {
   }
 
   async function handleScanAll() {
+    if (scanning === "all") return;
     setScanning("all");
     setError(null);
     try {
-      await triggerScanAll();
-      setData(await fetchVulnerabilitySummary());
+      const res = await triggerScanAll();
+      const total = (res as { device_count?: number }).device_count ?? (data?.summary?.total_devices ?? 0);
+      const scannedBefore = data?.summary?.scanned_devices ?? 0;
+      setScanProgress({ total, scannedBefore });
+      // Poll every 5s to refresh progress
+      if (pollRef.current) clearInterval(pollRef.current);
+      pollRef.current = setInterval(async () => {
+        try {
+          setData(await fetchVulnerabilitySummary());
+        } catch { /* ignore poll errors */ }
+      }, 5000);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Scan all failed");
-    } finally {
       setScanning("idle");
     }
   }
@@ -216,7 +245,9 @@ export function VulnerabilitiesClient({ initialData, initialError }: Props) {
             {scanning === "all" ? (
               <>
                 <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                Scanning all…
+                {scanProgress
+                  ? `Scanning… ${data?.summary?.scanned_devices ?? 0}/${scanProgress.total}`
+                  : "Starting scan…"}
               </>
             ) : (
               <>
