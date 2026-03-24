@@ -2434,6 +2434,24 @@ class AIOpsService:
             result.append(r)
         return result
 
+    def clear_advisory_checks(self, hostname: str) -> int:
+        """Delete all advisory impact checks for a device. Returns count deleted."""
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM advisory_checks
+                    WHERE device_id IN (
+                        SELECT id FROM devices
+                        WHERE LOWER(hostname) = LOWER(%s) OR ip_address = %s
+                    )
+                    """,
+                    (hostname, hostname),
+                )
+                deleted = cur.rowcount
+                conn.commit()
+                return deleted
+
     def save_advisory_check(
         self,
         hostname: str,

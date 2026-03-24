@@ -103,6 +103,12 @@ export function fetchAdvisoryChecks(hostname: string, advisoryId: string): Promi
   return fetchAIOps(`/api/aiops/devices/${encodeURIComponent(hostname)}/vulnerabilities/${encodeURIComponent(advisoryId)}/checks`);
 }
 
+export function clearAdvisoryChecks(hostname: string): Promise<{ deleted: number }> {
+  return fetchAIOps(`/api/aiops/devices/${encodeURIComponent(hostname)}/vulnerabilities/checks`, {
+    method: "DELETE",
+  });
+}
+
 export function fetchDeviceCheckSummary(hostname: string): Promise<AIOpsCheckSummary> {
   return fetchAIOps(`/api/aiops/devices/${encodeURIComponent(hostname)}/vulnerabilities/check-summary`);
 }

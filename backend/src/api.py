@@ -484,6 +484,14 @@ async def aiops_advisory_checks_endpoint(hostname: str, advisory_id: str):
     return _aiops_service.get_advisory_checks(hostname, advisory_id)
 
 
+@app.delete("/api/aiops/devices/{hostname}/vulnerabilities/checks")
+async def aiops_clear_checks_endpoint(hostname: str):
+    """Clear all advisory impact check results for a device (for testing)."""
+    _ensure_aiops_ready()
+    deleted = _aiops_service.clear_advisory_checks(hostname)
+    return {"deleted": deleted}
+
+
 @app.get("/api/aiops/devices/{hostname}/vulnerabilities/{advisory_id}/check")
 async def aiops_advisory_check_sse_endpoint(hostname: str, advisory_id: str):
     """Stream an LLM+SSH advisory impact check via Server-Sent Events."""
