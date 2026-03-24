@@ -115,14 +115,22 @@ def check_advisory_impact(
             f"Description: {summary}\n"
             f"Workaround hint: {workaround}\n\n"
             "Steps:\n"
-            "1. Run 2–5 targeted READ-ONLY `show` commands to check if the vulnerable "
+            "1. Run 2–4 targeted READ-ONLY `show` commands to check if the vulnerable "
             "feature/service is active on this device.\n"
             "2. Analyze the output.\n"
             "3. Return ONLY this JSON (no prose before or after):\n"
             '   {"verdict":"affected|not_affected|uncertain","confidence":0.0-1.0,"explanation":"..."}\n\n'
+            "IMPORTANT RULES:\n"
+            "- If a command returns '% Invalid input detected' or '% Unknown command', "
+            "the feature does NOT exist on this platform — do NOT retry the same command. "
+            "Treat absence of the command as strong evidence the feature is not present → likely not_affected.\n"
+            "- If running-config shows no configuration for the feature → not_affected.\n"
+            "- Stop running commands as soon as you have enough evidence. Max 4 commands total.\n"
+            "- NEVER run config commands.\n\n"
             "Guidance by advisory type:\n"
-            "- HTTP/HTTPS service → show ip http server status; show ip http secure-server\n"
+            "- HTTP/HTTPS service → show ip http server status\n"
             "- SSH server → show ip ssh\n"
+            "- TWAMP/IP SLA responder → show ip sla responder; show running-config | include twamp|responder\n"
             "- Smart Install → show vstack config\n"
             "- CDP → show cdp neighbors detail\n"
             "- NTP → show ntp status\n"
@@ -134,8 +142,7 @@ def check_advisory_impact(
             "- STP → show spanning-tree summary\n"
             "- VLAN/VTP → show vtp status\n"
             "- Netflow → show ip flow interface\n"
-            "Always start with `show version` if you need to confirm the exact platform.\n"
-            "NEVER run config commands. Max 5 commands total."
+            "Always start with `show version` only if you need to confirm the exact platform."
         )
 
         _emit("status", {"message": f"Analyzing {title[:70]}..."})
@@ -191,6 +198,26 @@ def check_advisory_impact(
                         tool_call_id=tc["id"],
                         name=tc_name,
                     ))
+
+        # If all iterations were used on tool calls and no verdict was returned,
+        # do one final synthesis call (no tools) to force the LLM to give a verdict.
+        if not final_text and commands_run:
+            evidence_lines = "\n".join(
+                f"$ {cr['command']}\n{cr['output'][:800]}" for cr in commands_run
+            )
+            synthesis_prompt = (
+                f"/no_think\nBased on the following CLI evidence collected from {hostname}, "
+                f"determine if the device is affected by: [{sir}] {title}\n\n"
+                f"CLI Evidence:\n{evidence_lines}\n\n"
+                "Return ONLY JSON: "
+                '{"verdict":"affected|not_affected|uncertain","confidence":0.0-1.0,"explanation":"one sentence"}'
+            )
+            try:
+                synth_model = create_chat_model(reasoning=False)  # no tools
+                synth_reply = synth_model.invoke([HumanMessage(content=synthesis_prompt)])
+                final_text = str(getattr(synth_reply, "content", "") or "")
+            except Exception as synth_exc:
+                logger.warning("Advisory check synthesis fallback failed: %s", synth_exc)
 
         # Parse verdict from LLM final message
         clean_text = _strip_think(final_text)
