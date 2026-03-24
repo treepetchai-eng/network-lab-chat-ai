@@ -522,7 +522,6 @@ export function VulnerabilitiesClient({ initialData, initialError }: Props) {
           <div className="space-y-3">
             {devices
               .filter((d) => d.llm_summary && ((d.critical_count ?? 0) > 0 || (d.high_count ?? 0) > 0))
-              .slice(0, 6)
               .map((d) => (
                 <div
                   key={d.id}
