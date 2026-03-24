@@ -28,6 +28,7 @@ const LABELS: Record<string, string> = {
   failed:            "Failed",
   cancelled:         "Cancelled",
   // Disposition
+  no_action_needed:   "No Action Needed",
   needs_human_review: "Human Review",
   self_recovered:     "Self Recovered",
   monitor_further:    "Monitor",
@@ -80,6 +81,7 @@ const STYLES: Record<string, string> = {
   cancelled:         "border-slate-700/40  bg-slate-700/20  text-slate-500",
 
   // Disposition
+  no_action_needed:   "border-slate-500/30   bg-slate-500/10   text-slate-400",
   needs_human_review: "border-amber-500/30 bg-amber-500/10 text-amber-300",
   self_recovered:     "border-emerald-500/30 bg-emerald-500/10 text-emerald-300",
   monitor_further:    "border-yellow-500/30  bg-yellow-500/10  text-yellow-300",

@@ -2714,6 +2714,7 @@ class AIOpsService:
                 # Determine next incident status based on disposition + whether proposal was created
                 disposition = result["disposition"]
                 status_map = {
+                    "no_action_needed": ("resolved", "no_action_needed"),
                     "self_recovered": ("monitoring", "self_recovered"),
                     "monitor_further": ("investigating", None),
                     "physical_issue": ("escalated", "physical_handoff"),
@@ -2732,7 +2733,21 @@ class AIOpsService:
                 if current_status in _RECOVERY_FORWARD_STATUSES and next_status not in _RECOVERY_FORWARD_STATUSES:
                     # Preserve the recovery-forward status; only log the troubleshoot result
                     next_status = current_status
-                if proposal:
+                # no_action_needed: port is intentionally inactive — resolve immediately, skip proposal
+                if disposition == "no_action_needed":
+                    proposal = None  # discard any proposal that may have been built
+                    cur.execute(
+                        """
+                        UPDATE incidents
+                        SET status = 'resolved',
+                            resolution_type = 'no_action_needed',
+                            resolved_at = NOW(),
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (incident["id"],),
+                    )
+                elif proposal:
                     cur.execute(
                         """
                         UPDATE incidents
