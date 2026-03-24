@@ -2246,13 +2246,15 @@ class AIOpsService:
                 cur.execute("SELECT hostname FROM devices ORDER BY hostname")
                 all_devices = [r["hostname"] for r in cur.fetchall()]
 
-                # Find devices with a recent scan (< 12 h old)
+                # Skip only devices with a SUCCESSFUL scan in the last 12 hours.
+                # Error scans are always retried.
                 cur.execute(
                     """
                     SELECT DISTINCT d.hostname
                     FROM devices d
                     JOIN device_vuln_scans s ON s.device_id = d.id
-                    WHERE s.scanned_at > NOW() - INTERVAL '12 hours'
+                    WHERE s.status = 'completed'
+                      AND s.scanned_at > NOW() - INTERVAL '12 hours'
                     """
                 )
                 recent = {r["hostname"] for r in cur.fetchall()}

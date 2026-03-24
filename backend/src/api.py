@@ -412,12 +412,27 @@ async def aiops_vuln_scan_all_endpoint():
     _ensure_aiops_ready()
     import threading as _threading
 
-    # Count devices to scan so frontend knows something started
+    # Count how many devices will actually be scanned (excludes recently completed)
     try:
-        summary = _aiops_service.get_vulnerability_summary()
-        total = summary.get("summary", {}).get("total_devices", 0)
+        from psycopg.types.json import Json as _Json
+        from src.aiops.db import connect as _connect
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS n FROM devices")
+                total = cur.fetchone()["n"]
+                cur.execute(
+                    """
+                    SELECT COUNT(DISTINCT d.id) AS n
+                    FROM devices d
+                    JOIN device_vuln_scans s ON s.device_id = d.id
+                    WHERE s.status = 'completed'
+                      AND s.scanned_at > NOW() - INTERVAL '12 hours'
+                    """
+                )
+                skip = cur.fetchone()["n"]
+        to_scan = total - skip
     except Exception:
-        total = 0
+        total, to_scan = 0, 0
 
     def _run():
         try:
@@ -426,7 +441,12 @@ async def aiops_vuln_scan_all_endpoint():
             logger.error("Background scan-all failed: %s", exc)
 
     _threading.Thread(target=_run, daemon=True).start()
-    return {"started": True, "device_count": total, "message": f"Scanning {total} device(s) in background"}
+    return {
+        "started": True,
+        "device_count": total,
+        "to_scan": to_scan,
+        "message": f"Scanning {to_scan} device(s) in background ({total - to_scan} recently scanned, skipped)",
+    }
 
 
 @app.get("/api/aiops/devices/{hostname}/vulnerabilities")

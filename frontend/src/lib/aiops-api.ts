@@ -95,7 +95,7 @@ export function fetchVulnerabilitySummary(): Promise<AIOpsVulnSummaryPayload> {
   return fetchAIOps("/api/aiops/vulnerabilities");
 }
 
-export function triggerScanAll(): Promise<{ started: boolean; device_count: number; message: string }> {
+export function triggerScanAll(): Promise<{ started: boolean; device_count: number; to_scan: number; message: string }> {
   return fetchAIOps("/api/aiops/vulnerabilities/scan-all", { method: "POST" });
 }
 

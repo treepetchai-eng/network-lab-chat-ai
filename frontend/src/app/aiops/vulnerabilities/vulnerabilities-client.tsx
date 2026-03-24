@@ -159,9 +159,15 @@ export function VulnerabilitiesClient({ initialData, initialError }: Props) {
     setError(null);
     try {
       const res = await triggerScanAll();
-      const total = (res as { device_count?: number }).device_count ?? (data?.summary?.total_devices ?? 0);
+      const toScan = res.to_scan ?? 0;
+      if (toScan === 0) {
+        // Nothing to scan (all recently completed) — show message and stop
+        setScanning("idle");
+        setError(res.message ?? "All devices were recently scanned.");
+        return;
+      }
       const scannedBefore = data?.summary?.scanned_devices ?? 0;
-      setScanProgress({ total, scannedBefore });
+      setScanProgress({ total: scannedBefore + toScan, scannedBefore });
       // Poll every 5s to refresh progress
       if (pollRef.current) clearInterval(pollRef.current);
       pollRef.current = setInterval(async () => {
