@@ -7,7 +7,7 @@ This node intentionally avoids strict-mode helpers such as:
   - heuristic target-host resolution
   - deterministic command selection
   - command profile fallback / auto-repair
-  - explicit backend routing hints
+  - rigid backend routing workflows
 
 The LLM decides:
   - whether to ground a device
@@ -20,11 +20,13 @@ The backend only provides runtime guardrails:
   - duplicate-call blocking
   - terminal connectivity failure blocking
   - context assembly / memory plumbing
+  - lightweight inventory-derived routing hints
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import ipaddress
 import json
 import logging
 import os
@@ -42,9 +44,14 @@ from langchain_core.messages import (
 
 from src.prompts.ssh_compact import SSH_COMPACT_PROMPT
 from src.prompts.ssh_synthesis import SSH_SYNTHESIS_PROMPT
-from src.tools.inventory_tools import list_all_devices, lookup_device
+from src.tools.interface_inventory import (
+    interface_inventory_hostnames,
+    resolve_ip_context,
+    resolve_prefix_context,
+)
+from src.tools.inventory_tools import list_all_devices, lookup_device, resolve_inventory_record
 from src.tools.db_tools import search_logs, search_incidents, get_incident_detail
-from src.formatters import parse_output
+from src.formatters import extract_executed_command, is_command_error, parse_output, strip_tool_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -113,15 +120,89 @@ _ALL_DEVICE_SCOPE_RE = re.compile(
     r"(ทุกตัว|ทุกเครื่อง|ทั้งหมด|all\s+devices|every\s+device)",
     re.IGNORECASE,
 )
+_EXISTING_EVIDENCE_FOLLOWUP_RE = re.compile(
+    r"(what\s+next|next\s+(?:step|check|action)|follow[\s-]*up|summary|summari[sz]e|"
+    r"explain|interpret|what\s+does\s+this\s+mean|root\s*cause|conclusion|"
+    r"recommend|assessment|because|why\b|"
+    r"สรุป|อธิบาย|แปลว่า|หมายความว่า|วิเคราะห์|ประเมิน|ข้อสรุป|"
+    r"ควร(?:เช็ค|ตรวจ|ทำ)อะไรต่อ|ต้องทำอะไรต่อ|ถัดไป|ต่อยังไง|"
+    r"เพราะอะไร|จากข้อมูล|จากที่มี|แนะนำต่อ)",
+    re.IGNORECASE,
+)
+_LIVE_RECHECK_RE = re.compile(
+    r"(^|\b)(show|run|ssh|ping|traceroute|trace|recheck|check\s+again|live\s+state|"
+    r"current\s+state|current\s+status|refresh|rerun|ตรวจใหม่|เช็คใหม่|รันใหม่|"
+    r"ลองใหม่|เข้าไปดู|ดูสด|สถานะปัจจุบัน)(\b|$)",
+    re.IGNORECASE,
+)
 _LOGICAL_TOPOLOGY_RE = re.compile(
     r"(logical\s+topology|routing\s+relationship|control-plane|control plane|"
     r"bgp|ospf|eigrp|เส้นทางเชิงตรรกะ|logical|topology.*logical|"
     r"physical\s+and\s+logical|physical\s*&\s*logical)",
     re.IGNORECASE,
 )
+_EXECUTION_TOOL_NAMES = {"run_cli", "run_diagnostic"}
 _LOGICAL_EVIDENCE_COMMAND_RE = re.compile(
     r"show ip protocols|show ip bgp summary|show ip ospf neighbor|"
     r"show ip eigrp neighbors|show ip default-gateway",
+    re.IGNORECASE,
+)
+_TRACE_RESOLVED_TARGET_RE = re.compile(
+    r"^\[RESOLVED TARGET\]\s*(?P<host>.+?)\s*\((?P<ip>[^)]+)\)\s*$",
+    re.MULTILINE,
+)
+_TRACE_TARGET_EXACT_OWNER_RE = re.compile(
+    r"^\s*-\s*exact owner\(s\):\s*(?P<host>\S+)",
+    re.MULTILINE,
+)
+_TRACE_HOP_ANNOTATION_RE = re.compile(
+    r"^\s*-\s*hop\s+(?P<hop>\d+):\s*(?P<body>.+)$",
+    re.MULTILINE,
+)
+_TRACE_EXACT_HOST_RE = re.compile(r"exact=(?P<host>\S+)")
+_TRACE_SAME_NETWORK_HOST_RE = re.compile(r"same_network=(?P<host>\S+)")
+_TRACE_CONNECTED_CANDIDATE_HOST_RE = re.compile(r"connected_candidates=(?P<host>\S+)")
+_TRACE_HOP_IP_RE = re.compile(r"^(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s*->")
+_ROUTING_QUERY_RE = re.compile(
+    r"(route|routing|next\s+hop|default\s+route|default-gateway|show\s+ip\s+route|"
+    r"traceroute|prefix|subnet|where\s+does.*(?:route|network|prefix)|"
+    r"which\s+device.*(?:route|network|prefix|interface)|"
+    r"เส้นทาง|หา route|หาเส้นทาง|route ไป|วิ่งทางไหน|วิ่งผ่าน|"
+    r"next hop|default route|อยู่ที่อุปกรณ์ตัวไหน|อยู่ที่ไหน|interface ไหน)",
+    re.IGNORECASE,
+)
+_CIDR_LITERAL_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}/\d{1,2}\b")
+_IP_LITERAL_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_ROUTING_CAPABLE_ROLES = {"router", "core_router", "dist_switch"}
+_ROUTING_ROLE_PRIORITY = {
+    "core_router": 0,
+    "router": 1,
+    "dist_switch": 2,
+    "access_switch": 3,
+}
+_TRACE_SYMMETRY_QUERY_RE = re.compile(
+    r"(same\s+path|same\s+route|path\s+symmetr|route\s+symmetr|"
+    r"symmetric|asymmetric|forward.*reverse.*traceroute|"
+    r"ทางเดียวกัน|เส้นทางเดียวกัน|สมมาตร|ไม่สมมาตร|ไปกลับทางเดียวกัน)",
+    re.IGNORECASE,
+)
+_SYMMETRIC_VERDICT_RE = re.compile(
+    r"(\blikely\s+symmetric\b|\bsymmetric\b|ทางเดียวกัน|เส้นทางเดียวกัน|สมมาตร)",
+    re.IGNORECASE,
+)
+_ASYMMETRIC_VERDICT_RE = re.compile(
+    r"(\blikely\s+asymmetric\b|\basymmetric\b|not\s+symmetric|different\s+path|"
+    r"ไม่สมมาตร|คนละทาง|ต่างทาง)",
+    re.IGNORECASE,
+)
+_ANY_IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_THAI_CHAR_RE = re.compile(r"[ก-๙]")
+_HALF_TRANSLATED_ROUTE_LABEL_RE = re.compile(
+    r"(?:[ก-๙](?:target|device|destination)|(?:target|device|destination)[ก-๙]|target\s+device|destination\s+device)",
+    re.IGNORECASE,
+)
+_ROUTE_DESTINATION_DETAIL_RE = re.compile(
+    r"(device/interface|interface ไหน|interface อะไร|จบที่|ปลายทาง|destination)",
     re.IGNORECASE,
 )
 
@@ -136,6 +217,345 @@ def _build_cache_section(device_cache: dict) -> str:
         for host, info in device_cache.items()
     ]
     return "\n".join(lines)
+
+
+def _cache_inventory_record(device_cache: dict, record: dict[str, Any] | None) -> None:
+    if not record:
+        return
+    hostname = str(record.get("hostname", "") or "").strip()
+    if not hostname:
+        return
+    tunnel_ips_raw = record.get("tunnel_ips", []) or []
+    if isinstance(tunnel_ips_raw, str):
+        tunnel_ips = [item.strip() for item in tunnel_ips_raw.split() if item.strip()]
+    else:
+        tunnel_ips = [str(item).strip() for item in tunnel_ips_raw if str(item).strip()]
+    device_cache[hostname] = {
+        "ip_address": str(record.get("ip_address", "") or ""),
+        "os_platform": str(record.get("os_platform", "") or ""),
+        "device_role": str(record.get("device_role", "") or ""),
+        "site": str(record.get("site", "") or ""),
+        "version": str(record.get("version", "") or ""),
+        "tunnel_ips": tunnel_ips,
+    }
+
+
+def _device_info_for_host(hostname: str, device_cache: dict) -> dict[str, Any]:
+    for cached_host, info in device_cache.items():
+        if cached_host.lower() == hostname.lower():
+            return info
+    resolved = resolve_inventory_record(hostname)
+    if not resolved:
+        return {}
+    return {
+        "ip_address": str(resolved.get("ip_address", "") or ""),
+        "os_platform": str(resolved.get("os_platform", "") or ""),
+        "device_role": str(resolved.get("device_role", "") or ""),
+        "site": str(resolved.get("site", "") or ""),
+        "version": str(resolved.get("version", "") or ""),
+    }
+
+
+def _is_routing_capable_role(role: str) -> bool:
+    return (role or "").strip().lower() in _ROUTING_CAPABLE_ROLES
+
+
+def _extract_query_ips_and_prefixes(query: str) -> tuple[list[str], list[str]]:
+    cidrs: list[str] = []
+    cidr_seen: set[str] = set()
+    ip_bases_in_prefixes: set[str] = set()
+    for match in _CIDR_LITERAL_RE.findall(query or ""):
+        try:
+            normalized = str(ipaddress.ip_network(match, strict=False))
+        except ValueError:
+            continue
+        if normalized in cidr_seen:
+            continue
+        cidrs.append(normalized)
+        cidr_seen.add(normalized)
+        ip_bases_in_prefixes.add(normalized.split("/", 1)[0])
+
+    ips: list[str] = []
+    ip_seen: set[str] = set()
+    for match in _IP_LITERAL_RE.findall(query or ""):
+        try:
+            ipaddress.ip_address(match)
+        except ValueError:
+            continue
+        if match in ip_seen or match in ip_bases_in_prefixes:
+            continue
+        ips.append(match)
+        ip_seen.add(match)
+
+    return ips, cidrs
+
+
+def _extract_query_host_mentions(query: str) -> list[str]:
+    lowered = (query or "").lower()
+    matches: list[tuple[int, int, str]] = []
+    for hostname in interface_inventory_hostnames():
+        position = lowered.find(hostname.lower())
+        if position >= 0:
+            matches.append((position, -len(hostname), hostname))
+    matches.sort()
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for _position, _neg_len, hostname in matches:
+        if hostname not in seen:
+            seen.add(hostname)
+            ordered.append(hostname)
+    return ordered
+
+
+def _format_interface_context(row: dict[str, str]) -> str:
+    hostname = row.get("hostname", "?")
+    interface_name = row.get("interface_name", "?")
+    interface_mode = row.get("interface_mode", "")
+    network_cidr = row.get("network_cidr", "")
+    description = row.get("description", "")
+    role = row.get("device_role", "")
+    parts = [f"{hostname} {interface_name}"]
+    if interface_mode:
+        parts.append(f"[{interface_mode}]")
+    extras: list[str] = []
+    if role:
+        extras.append(f"role={role}")
+    if network_cidr:
+        extras.append(f"network={network_cidr}")
+    access_vlan = row.get("access_vlan", "")
+    vlan_tag = row.get("vlan_tag", "")
+    vlan_value = vlan_tag or access_vlan
+    if vlan_value:
+        extras.append(f"vlan={vlan_value}")
+    if description:
+        extras.append(f"desc={description}")
+    summary = " ".join(parts)
+    if extras:
+        summary += " " + ", ".join(extras)
+    return summary
+
+
+def _role_priority_for_host(hostname: str, device_cache: dict) -> tuple[int, str]:
+    role = str(_device_info_for_host(hostname, device_cache).get("device_role", "") or "").strip().lower()
+    return (_ROUTING_ROLE_PRIORITY.get(role, 99), hostname)
+
+
+def _analyze_routing_inventory(user_query: str, device_cache: dict) -> dict[str, Any]:
+    query = user_query or ""
+    ips, prefixes = _extract_query_ips_and_prefixes(query)
+    host_mentions = _extract_query_host_mentions(query)
+    is_routing_query = bool(_ROUTING_QUERY_RE.search(query)) or bool(prefixes) or (
+        bool(ips) and bool(host_mentions)
+    )
+    if not is_routing_query:
+        return {
+            "mentioned_hosts": [],
+            "ips": [],
+            "prefixes": [],
+            "ip_contexts": [],
+            "prefix_contexts": [],
+            "recommended_hosts": [],
+            "candidate_reasons": {},
+        }
+
+    candidate_buckets: dict[int, list[str]] = {0: [], 1: [], 2: []}
+    candidate_reasons: dict[str, list[str]] = {}
+
+    def add_candidate(hostname: str, reason: str, bucket: int) -> None:
+        if not hostname:
+            return
+        candidate_buckets.setdefault(bucket, []).append(hostname)
+        reasons = candidate_reasons.setdefault(hostname, [])
+        if reason and reason not in reasons:
+            reasons.append(reason)
+
+    for hostname in host_mentions:
+        add_candidate(hostname, "user-mentioned device in the request", 0)
+
+    ip_contexts: list[dict[str, Any]] = []
+    for ip_value in ips[:3]:
+        context = resolve_ip_context(ip_value)
+        ip_contexts.append({
+            "ip": ip_value,
+            "exact_matches": context.get("exact_matches", []),
+            "network_matches": context.get("network_matches", []),
+        })
+        for row in context.get("exact_matches", []):
+            hostname = row.get("hostname", "")
+            reason = f"exact owner of {ip_value} via {row.get('interface_name', '?')}"
+            bucket = 1 if _is_routing_capable_role(row.get("device_role", "")) else 2
+            add_candidate(hostname, reason, bucket)
+        for row in context.get("network_matches", []):
+            hostname = row.get("hostname", "")
+            reason = (
+                f"connected owner of {row.get('network_cidr', ip_value)} via "
+                f"{row.get('interface_name', '?')}"
+            )
+            bucket = 1 if _is_routing_capable_role(row.get("device_role", "")) else 2
+            add_candidate(hostname, reason, bucket)
+
+    prefix_contexts: list[dict[str, Any]] = []
+    for prefix_value in prefixes[:3]:
+        context = resolve_prefix_context(prefix_value)
+        prefix_contexts.append({
+            "prefix": prefix_value,
+            "normalized_prefix": context.get("normalized_prefix", prefix_value),
+            "exact_matches": context.get("exact_matches", []),
+            "overlapping_matches": context.get("overlapping_matches", []),
+        })
+        for row in context.get("exact_matches", []):
+            hostname = row.get("hostname", "")
+            reason = f"owns connected prefix {context.get('normalized_prefix', prefix_value)}"
+            bucket = 1 if _is_routing_capable_role(row.get("device_role", "")) else 2
+            add_candidate(hostname, reason, bucket)
+        for row in context.get("overlapping_matches", []):
+            hostname = row.get("hostname", "")
+            reason = (
+                f"overlaps {context.get('normalized_prefix', prefix_value)} via "
+                f"{row.get('interface_name', '?')}"
+            )
+            bucket = 1 if _is_routing_capable_role(row.get("device_role", "")) else 2
+            add_candidate(hostname, reason, bucket)
+
+    recommended_hosts: list[str] = []
+    seen_hosts: set[str] = set()
+    for bucket_index in (0, 1, 2):
+        hosts = candidate_buckets.get(bucket_index, [])
+        if bucket_index == 0:
+            ordered_bucket = hosts
+        else:
+            ordered_bucket = sorted(set(hosts), key=lambda host: _role_priority_for_host(host, device_cache))
+        for hostname in ordered_bucket:
+            if hostname not in seen_hosts:
+                seen_hosts.add(hostname)
+                recommended_hosts.append(hostname)
+
+    return {
+        "mentioned_hosts": host_mentions,
+        "ips": ips,
+        "prefixes": prefixes,
+        "ip_contexts": ip_contexts,
+        "prefix_contexts": prefix_contexts,
+        "recommended_hosts": recommended_hosts,
+        "candidate_reasons": candidate_reasons,
+    }
+
+
+def _prefill_routing_candidates(device_cache: dict, analysis: dict[str, Any]) -> None:
+    for hostname in analysis.get("recommended_hosts", [])[:4]:
+        if any(cached_host.lower() == hostname.lower() for cached_host in device_cache):
+            continue
+        _cache_inventory_record(device_cache, resolve_inventory_record(hostname))
+
+
+def _build_routing_context_section(analysis: dict[str, Any], device_cache: dict) -> str:
+    recommended_hosts = analysis.get("recommended_hosts", [])
+    if not recommended_hosts and not analysis.get("ip_contexts") and not analysis.get("prefix_contexts"):
+        return ""
+
+    lines = ["=== ACTIVE ROUTING CONTEXT ==="]
+    mentioned_hosts = analysis.get("mentioned_hosts", [])
+    if mentioned_hosts:
+        lines.append("User-mentioned devices: " + ", ".join(mentioned_hosts[:4]))
+
+    for item in analysis.get("ip_contexts", [])[:3]:
+        ip_value = item.get("ip", "")
+        exact_matches = item.get("exact_matches", [])
+        network_matches = item.get("network_matches", [])
+        if exact_matches:
+            lines.append(f"Target IP {ip_value} exact interface owner(s):")
+            for row in exact_matches[:3]:
+                lines.append(f"- {_format_interface_context(row)}")
+        if network_matches:
+            lines.append(f"Target IP {ip_value} matching connected network(s):")
+            for row in network_matches[:4]:
+                lines.append(f"- {_format_interface_context(row)}")
+
+    for item in analysis.get("prefix_contexts", [])[:3]:
+        normalized_prefix = item.get("normalized_prefix", item.get("prefix", ""))
+        exact_matches = item.get("exact_matches", [])
+        overlapping_matches = item.get("overlapping_matches", [])
+        if exact_matches:
+            lines.append(f"Prefix {normalized_prefix} exact connected owner(s):")
+            for row in exact_matches[:4]:
+                lines.append(f"- {_format_interface_context(row)}")
+        elif overlapping_matches:
+            lines.append(f"Prefix {normalized_prefix} overlapping owner(s):")
+            for row in overlapping_matches[:4]:
+                lines.append(f"- {_format_interface_context(row)}")
+
+    if recommended_hosts:
+        lines.append("Preferred live-check starting hosts:")
+        candidate_reasons = analysis.get("candidate_reasons", {})
+        for index, hostname in enumerate(recommended_hosts[:4], start=1):
+            info = _device_info_for_host(hostname, device_cache)
+            role = str(info.get("device_role", "") or "").strip()
+            site = str(info.get("site", "") or "").strip()
+            tags = ", ".join(part for part in (role, site) if part)
+            reason = "; ".join(candidate_reasons.get(hostname, [])[:2])
+            if tags:
+                lines.append(f"{index}. {hostname} ({tags}) - {reason}")
+            else:
+                lines.append(f"{index}. {hostname} - {reason}")
+
+        route_target = ""
+        prefixes = analysis.get("prefixes", [])
+        ips = analysis.get("ips", [])
+        if prefixes:
+            route_target = prefixes[0]
+        elif ips:
+            route_target = ips[0]
+        if route_target:
+            lines.append(
+                f"On routing-capable devices, start with `show ip route {route_target}` before broader checks."
+            )
+        if any(
+            str(_device_info_for_host(hostname, device_cache).get("device_role", "") or "").strip().lower()
+            == "access_switch"
+            for hostname in recommended_hosts[:4]
+        ):
+            lines.append(
+                "If the starting device is an access switch, prefer `show ip default-gateway` or "
+                "`show ip interface brief` before assuming full routing-table visibility."
+            )
+        lines.append("Ground any recommended host not already in cache before running CLI.")
+
+    lines.append("================================")
+    return "\n".join(lines)
+
+
+def _build_compact_prompt(
+    *,
+    device_cache: dict,
+    incident_context: str,
+    user_query: str,
+) -> tuple[str, str]:
+    analysis = _analyze_routing_inventory(user_query, device_cache)
+    _prefill_routing_candidates(device_cache, analysis)
+    cache_section = _build_cache_section(device_cache)
+    prompt = SSH_COMPACT_PROMPT.format(device_cache_section=cache_section)
+    routing_context = _build_routing_context_section(analysis, device_cache)
+
+    sections: list[str] = []
+    if incident_context:
+        sections.append(
+            "=== ACTIVE INCIDENT CONTEXT ===\n"
+            f"{incident_context}\n"
+            "================================\n\n"
+            "You are assisting a network engineer who is investigating the incident above. "
+            "Focus your investigation on the affected device and interface listed in the context. "
+            "If the incident context or recorded troubleshoot evidence already answers a follow-up "
+            "question, answer from that existing evidence first. "
+            "Do not rerun the same command unless the user explicitly asks for a fresh live re-check "
+            "or the existing evidence is clearly insufficient. "
+            "You can run additional CLI commands only when new evidence is still needed. "
+            "The automated AIOps pipeline may also be running commands on the same device — "
+            "your commands will queue safely behind any in-flight pipeline work."
+        )
+    if routing_context:
+        sections.append(routing_context)
+    sections.append(prompt)
+    return "\n\n".join(sections), cache_section
 
 
 def _find_user_query(messages: list[BaseMessage]) -> str:
@@ -297,9 +717,14 @@ def _sanitize_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
                             content = "Inventory devices:\n" + "\n".join(entries)
                 except json.JSONDecodeError:
                     pass
-            elif tool_name == "run_cli":
+            elif tool_name in _EXECUTION_TOOL_NAMES:
                 args = metadata.get("tool_args", {})
-                command = str(args.get("command", "") or "").strip()
+                command = str(
+                    metadata.get("executed_command")
+                    or args.get("command", "")
+                    or extract_executed_command(content)
+                    or ""
+                ).strip()
                 requested_host = str(args.get("host", "") or "").strip()
                 status = str(metadata.get("tool_status", "") or "").strip() or "unknown"
                 host, ip, os_type, body = parse_output(content)
@@ -307,6 +732,9 @@ def _sanitize_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
                 details = [f"status={status}", f"host={resolved_host}"]
                 if command:
                     details.append(f"command={command}")
+                diagnostic_kind = str(args.get("kind", "") or "").strip()
+                if diagnostic_kind:
+                    details.append(f"kind={diagnostic_kind}")
                 if ip:
                     details.append(f"ip={ip}")
                 if os_type:
@@ -354,6 +782,88 @@ def _build_synthesis_context(messages: list[BaseMessage]) -> list[BaseMessage]:
     return relevant
 
 
+def _has_existing_execution_evidence(messages: list[BaseMessage]) -> bool:
+    return any(
+        isinstance(message, ToolMessage) and getattr(message, "name", "") in _EXECUTION_TOOL_NAMES
+        for message in messages
+    )
+
+
+def _should_answer_from_existing_incident_evidence(
+    *,
+    user_query: str,
+    messages: list[BaseMessage],
+    incident_context: str,
+) -> bool:
+    if not incident_context.strip():
+        return False
+    if not user_query.strip():
+        return False
+    if not _has_existing_execution_evidence(messages):
+        return False
+    if _LIVE_RECHECK_RE.search(user_query):
+        return False
+    return bool(_EXISTING_EVIDENCE_FOLLOWUP_RE.search(user_query))
+
+
+def _answer_from_existing_incident_evidence(
+    *,
+    answer_llm: SupportsInvoke,
+    user_query: str,
+    messages: list[BaseMessage],
+    device_cache: dict[str, Any],
+    incident_context: str,
+    progress_sink: dict | None = None,
+) -> AIMessage | None:
+    relevant_messages = _assemble_relevant_context(
+        messages,
+        device_cache,
+        char_budget=_FREE_RUN_CONTEXT_CHAR_BUDGET,
+    )
+    clean_messages = _sanitize_messages(relevant_messages)
+    if not clean_messages:
+        return None
+
+    system_text = (
+        (
+            "=== ACTIVE INCIDENT CONTEXT ===\n"
+            f"{incident_context}\n"
+            "================================\n\n"
+        )
+        + "You are answering a follow-up question about an active incident. "
+        + "The conversation already contains recorded troubleshoot evidence for this incident. "
+        + "Use that existing evidence first. Do not propose rerunning the same command unless the "
+        + "user explicitly asks for a fresh live re-check or the recorded evidence is insufficient.\n\n"
+        + SSH_SYNTHESIS_PROMPT.format(device_cache_section=_build_cache_section(device_cache))
+    )
+    instruction = HumanMessage(
+        content=(
+            "[System: Use recorded incident evidence first]\n"
+            "Answer the latest user request directly from the recorded troubleshoot evidence "
+            "already present in this session.\n"
+            "Do not call tools.\n"
+            "Do not pretend a fresh check happened.\n"
+            "If the recorded evidence includes failed SSH access, say so clearly and base the "
+            "next-step guidance on that recorded limitation.\n"
+            "If the existing evidence already supports the answer, do not ask to rerun the same command.\n"
+            f"Latest user request: {user_query}"
+        )
+    )
+
+    progress_callback = (progress_sink or {}).get("callback")
+    if progress_callback:
+        progress_callback({
+            "kind": "status",
+            "text": "Answering from recorded incident evidence...",
+        })
+
+    response = answer_llm.invoke([SystemMessage(content=system_text), *clean_messages, instruction])
+    content = _THINK_RE.sub("", str(response.content or "")).strip()
+    if not content:
+        return None
+    return AIMessage(content=content, additional_kwargs={"phase": "existing_evidence_followup"})
+
+
 def _iter_tool_messages(*message_groups: list[BaseMessage]) -> Any:
     for group in message_groups:
         if not group:
@@ -366,13 +876,18 @@ def _iter_tool_messages(*message_groups: list[BaseMessage]) -> Any:
 def _extract_run_cli_items(*message_groups: list[BaseMessage]) -> list[dict[str, str]]:
     items: list[dict[str, str]] = []
     for message in _iter_tool_messages(*message_groups):
-        if getattr(message, "name", "") != "run_cli":
+        if getattr(message, "name", "") not in _EXECUTION_TOOL_NAMES:
             continue
         metadata = getattr(message, "additional_kwargs", {}) or {}
         args = metadata.get("tool_args", {})
         status = str(metadata.get("tool_status", "") or "unknown").strip() or "unknown"
         requested_host = str(args.get("host", "") or "").strip()
-        command = str(args.get("command", "") or "").strip()
+        command = str(
+            metadata.get("executed_command")
+            or args.get("command", "")
+            or extract_executed_command(str(message.content))
+            or ""
+        ).strip()
         host, ip, os_type, body = parse_output(str(message.content))
         resolved_host = host or requested_host or "unknown"
         items.append({
@@ -415,9 +930,14 @@ def _is_terminal_tool_output(output: str) -> bool:
     return any(stripped.startswith(prefix) for prefix in _TERMINAL_ERROR_PREFIXES)
 
 
+def _is_tool_command_error(output: str) -> bool:
+    _host, _ip, _os_type, body = parse_output(output)
+    return is_command_error(body or output)
+
+
 def _condense_run_cli_output(*, command: str, status: str, raw_body: str) -> str:
     """Return an LLM-friendly summary while preserving key evidence."""
-    body = (raw_body or "").strip()
+    body = strip_tool_metadata(raw_body or "").strip()
     if not body:
         return "(empty output)"
 
@@ -505,10 +1025,11 @@ def _execute_run_cli_batch(
     *,
     progress_sink: dict | None = None,
     run_cli_tool,
+    run_diagnostic_tool=None,
     executed_calls: set[tuple[str, str]],
     terminal_failures: set[str],
 ) -> list[dict[str, Any]]:
-    """Execute multiple run_cli tool calls, sequential per host, parallel across hosts."""
+    """Execute multiple execution tool calls, sequential per host, parallel across hosts."""
     results: list[dict[str, Any]] = []
     # Group valid (non-blocked) calls by host for sequential execution per device.
     host_queues: dict[str, list[tuple[int, dict, dict]]] = {}
@@ -519,10 +1040,19 @@ def _execute_run_cli_batch(
 
     for index, tc in enumerate(tool_calls):
         args = dict(tc["args"])
+        tool_name = str(tc.get("name", "") or "")
         host = str(args.get("host", "") or "").strip()
-        command = str(args.get("command", "") or "").strip()
+        if tool_name == "run_diagnostic":
+            signature_detail = (
+                f"{tool_name}:"
+                f"{str(args.get('kind', '') or '').strip().lower()}:"
+                f"{str(args.get('target', '') or '').strip()}:"
+                f"{args.get('count', 2)}:{args.get('timeout', 1)}"
+            )
+        else:
+            signature_detail = str(args.get("command", "") or "").strip()
         tool_metadata = {"tool_args": tc.get("args", {})}
-        command_sig = (host, command)
+        command_sig = (host, signature_detail)
 
         if host in terminal_failures:
             output = (
@@ -579,10 +1109,17 @@ def _execute_run_cli_batch(
                 )
                 tool_metadata["tool_status"] = "blocked"
             else:
-                output = run_cli_tool.invoke(dict(tc["args"]))
+                if tc.get("name") == "run_diagnostic":
+                    if run_diagnostic_tool is None:
+                        output = "[BLOCKED] Diagnostic tool is not configured for this graph."
+                    else:
+                        output = run_diagnostic_tool.invoke(dict(tc["args"]))
+                        tool_metadata["executed_command"] = extract_executed_command(output)
+                else:
+                    output = run_cli_tool.invoke(dict(tc["args"]))
                 if output.startswith("[BLOCKED]"):
                     tool_metadata["tool_status"] = "blocked"
-                elif output.startswith("[ERROR]") or _is_terminal_tool_output(output):
+                elif output.startswith("[ERROR]") or _is_terminal_tool_output(output) or _is_tool_command_error(output):
                     tool_metadata["tool_status"] = "error"
                 else:
                     tool_metadata["tool_status"] = "success"
@@ -621,6 +1158,7 @@ def free_run_node(
     llm: SupportsToolBinding,
     answer_llm: SupportsInvoke,
     run_cli_tool,
+    run_diagnostic_tool=None,
     progress_sink: dict | None = None,
 ) -> dict:
     device_cache: dict = state.get("device_cache", {})
@@ -628,23 +1166,11 @@ def free_run_node(
     incident_context: str = state.get("incident_context", "") or ""
     user_query = _find_user_query(messages)
 
-    cache_section = _build_cache_section(device_cache)
-    # Compact prompt for tool-calling iterations (fewer tokens → faster inference)
-    compact_prompt = SSH_COMPACT_PROMPT.format(device_cache_section=cache_section)
-    # For incident-scoped sessions, prepend incident context so the LLM knows
-    # exactly which device/incident it is assisting with, without scanning all devices.
-    if incident_context:
-        compact_prompt = (
-            f"=== ACTIVE INCIDENT CONTEXT ===\n"
-            f"{incident_context}\n"
-            f"================================\n\n"
-            f"You are assisting a network engineer who is investigating the incident above. "
-            f"Focus your investigation on the affected device and interface listed in the context. "
-            f"You can run additional CLI commands to gather more information. "
-            f"The automated AIOps pipeline may also be running commands on the same device — "
-            f"your commands will queue safely behind any in-flight pipeline work.\n\n"
-            + compact_prompt
-        )
+    compact_prompt, cache_section = _build_compact_prompt(
+        device_cache=device_cache,
+        incident_context=incident_context,
+        user_query=user_query,
+    )
     compact_system_msg = SystemMessage(content=compact_prompt)
     # Synthesis prompt is built lazily only when tools were executed (see below)
 
@@ -656,10 +1182,42 @@ def free_run_node(
     prior_tool_messages = list(_iter_tool_messages(messages))
     clean_msgs = _sanitize_messages(relevant_messages)
 
-    llm_with_tools = llm.bind_tools([
-        lookup_device, list_all_devices, run_cli_tool,
-        search_logs, search_incidents, get_incident_detail,
-    ])
+    if _should_answer_from_existing_incident_evidence(
+        user_query=user_query,
+        messages=messages,
+        incident_context=incident_context,
+    ):
+        existing_evidence_answer = _answer_from_existing_incident_evidence(
+            answer_llm=answer_llm,
+            user_query=user_query,
+            messages=messages,
+            device_cache=device_cache,
+            incident_context=incident_context,
+            progress_sink=progress_sink,
+        )
+        if existing_evidence_answer is not None:
+            return {
+                "messages": [existing_evidence_answer],
+                "device_cache": device_cache,
+                "grounded_entities": {
+                    "devices": sorted(device_cache.keys()),
+                    "latest_query": user_query,
+                },
+                "active_device": "",
+                "active_topic": user_query,
+            }
+
+    tools = [
+        lookup_device,
+        list_all_devices,
+        run_cli_tool,
+        search_logs,
+        search_incidents,
+        get_incident_detail,
+    ]
+    if run_diagnostic_tool is not None:
+        tools.insert(3, run_diagnostic_tool)
+    llm_with_tools = llm.bind_tools(tools)
     loop_messages: list[BaseMessage] = [compact_system_msg] + clean_msgs
     result_messages: list[BaseMessage] = []
     executed_calls: set[tuple[str, str]] = set()
@@ -787,23 +1345,27 @@ def free_run_node(
         iteration_terminal = True
         has_executed_tools = True
 
-        run_cli_calls = [tc for tc in response.tool_calls if tc["name"] == "run_cli"]
-        run_cli_results_by_id: dict[str, dict[str, Any]] = {}
-        if run_cli_calls:
+        execution_calls = [
+            tc for tc in response.tool_calls
+            if tc["name"] in _EXECUTION_TOOL_NAMES
+        ]
+        execution_results_by_id: dict[str, dict[str, Any]] = {}
+        if execution_calls:
             progress_callback = (progress_sink or {}).get("callback")
-            if progress_callback and len(run_cli_calls) > 1:
+            if progress_callback and len(execution_calls) > 1:
                 progress_callback({
                     "kind": "status",
-                    "text": f"Running {len(run_cli_calls)} CLI checks in parallel ...",
+                    "text": f"Running {len(execution_calls)} execution checks in parallel ...",
                 })
             batch_results = _execute_run_cli_batch(
-                run_cli_calls,
+                execution_calls,
                 progress_sink=progress_sink,
                 run_cli_tool=run_cli_tool,
+                run_diagnostic_tool=run_diagnostic_tool,
                 executed_calls=executed_calls,
                 terminal_failures=terminal_failures,
             )
-            run_cli_results_by_id = {
+            execution_results_by_id = {
                 item["tc"]["id"]: item for item in batch_results
             }
 
@@ -822,12 +1384,12 @@ def free_run_node(
                 tool_metadata = {"tool_args": tc.get("args", {})}
                 output = list_all_devices.invoke(tc["args"])
                 _update_cache_from_lookup_result(device_cache, output)
-            elif tc["name"] == "run_cli":
+            elif tc["name"] in _EXECUTION_TOOL_NAMES:
                 args = dict(tc["args"])
                 host = str(args.get("host", "") or "").strip()
                 if host:
                     latest_grounded_host = host
-                batch_result = run_cli_results_by_id[tc["id"]]
+                batch_result = execution_results_by_id[tc["id"]]
                 output = batch_result["output"]
                 tool_metadata = batch_result["tool_metadata"]
             elif tc["name"] == "search_logs":
@@ -859,10 +1421,12 @@ def free_run_node(
         # without having to parse old tool-result messages.
         new_cache_section = _build_cache_section(device_cache)
         if new_cache_section != cache_section:
-            cache_section = new_cache_section
-            loop_messages[0] = SystemMessage(
-                content=SSH_COMPACT_PROMPT.format(device_cache_section=cache_section)
+            compact_prompt, cache_section = _build_compact_prompt(
+                device_cache=device_cache,
+                incident_context=incident_context,
+                user_query=user_query,
             )
+            loop_messages[0] = SystemMessage(content=compact_prompt)
 
         if terminal_failures and not is_troubleshoot:
             break
@@ -930,6 +1494,11 @@ def _synthesize_final_answer(
 
     clean_results = _sanitize_messages(result_messages)
     evidence_digest = _build_evidence_digest(result_messages)
+    trace_symmetry_digest, trace_symmetry_analyses = _assess_traceroute_symmetry(result_messages)
+    route_context_digest, route_context = _build_route_context_digest(
+        user_query=user_query,
+        device_cache=device_cache,
+    )
     coverage_digest = _build_scope_coverage_digest(
         device_cache=device_cache,
         session_messages=session_messages,
@@ -940,6 +1509,8 @@ def _synthesize_final_answer(
         result_messages=result_messages,
     )
     relationship_instruction = _relationship_analysis_instruction(user_query)
+    route_path_instruction = _route_path_instruction(user_query, route_context_digest)
+    trace_symmetry_instruction = _trace_symmetry_instruction(user_query, trace_symmetry_digest)
     inventory_only_instruction = _inventory_only_instruction(result_messages)
     synthesis_instruction = HumanMessage(
         content=(
@@ -978,11 +1549,14 @@ def _synthesize_final_answer(
             "protocol/control-plane evidence.\n"
             f"{inventory_only_instruction}"
             f"{relationship_instruction}"
+            f"{route_path_instruction}"
+            f"{trace_symmetry_instruction}"
             "IMPORTANT: The evidence digest below contains exact verified counts "
             "from executed tools. You MUST use these exact numbers in your answer. "
             "Do not recalculate or invent different numbers.\n"
             f"{coverage_digest}\n"
             f"{evidence_digest}\n"
+            f"{route_context_digest}\n"
             f"{session_evidence_digest}\n"
             f"Latest user request: {user_query}"
         )
@@ -1028,6 +1602,36 @@ def _synthesize_final_answer(
             user_query=user_query,
         )
         phase = "consistency_repair"
+    elif _trace_symmetry_answer_needs_repair(content, user_query, trace_symmetry_analyses):
+        if progress_callback:
+            progress_callback({
+                "kind": "status",
+                "text": "Correcting traceroute path analysis...",
+            })
+        content = _repair_trace_symmetry_answer(
+            answer_llm=answer_llm,
+            system_msg=system_msg,
+            candidate_answer=content,
+            trace_symmetry_digest=trace_symmetry_digest,
+            evidence_digest=evidence_digest,
+            user_query=user_query,
+        )
+        phase = "symmetry_repair"
+    elif _route_answer_needs_repair(content, user_query, route_context):
+        if progress_callback:
+            progress_callback({
+                "kind": "status",
+                "text": "Polishing route-path explanation...",
+            })
+        content = _repair_route_answer(
+            answer_llm=answer_llm,
+            system_msg=system_msg,
+            candidate_answer=content,
+            route_context_digest=route_context_digest,
+            evidence_digest=evidence_digest,
+            user_query=user_query,
+        )
+        phase = "route_repair"
     elif _relationship_answer_needs_repair(content, user_query):
         if progress_callback:
             progress_callback({
@@ -1102,16 +1706,16 @@ def _relationship_analysis_instruction(user_query: str) -> str:
 
 def _inventory_only_instruction(result_messages: list[BaseMessage]) -> str:
     has_inventory_tool = False
-    has_run_cli = False
+    has_execution_tool = False
     for message in result_messages:
         if not isinstance(message, ToolMessage):
             continue
         tool_name = getattr(message, "name", "")
         if tool_name in {"lookup_device", "list_all_devices"}:
             has_inventory_tool = True
-        elif tool_name == "run_cli":
-            has_run_cli = True
-    if not has_inventory_tool or has_run_cli:
+        elif tool_name in _EXECUTION_TOOL_NAMES:
+            has_execution_tool = True
+    if not has_inventory_tool or has_execution_tool:
         return ""
     return (
         "IMPORTANT: The executed evidence is inventory-only and contains no "
@@ -1121,6 +1725,471 @@ def _inventory_only_instruction(result_messages: list[BaseMessage]) -> str:
         "Do NOT claim devices are reachable, healthy, operational, ready, up, "
         "or verified live from inventory alone.\n"
     )
+
+
+def _build_route_context_digest(
+    user_query: str,
+    device_cache: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    analysis = _analyze_routing_inventory(user_query, device_cache)
+    if not (
+        analysis.get("recommended_hosts")
+        or analysis.get("ip_contexts")
+        or analysis.get("prefix_contexts")
+    ):
+        return "", {
+            "analysis": analysis,
+            "exact_owner_hosts": [],
+            "exact_owner_interfaces": [],
+        }
+
+    lines = ["[Route Context Digest]"]
+    mentioned_hosts = analysis.get("mentioned_hosts", [])
+    if mentioned_hosts:
+        lines.append("- mentioned_hosts=" + " ; ".join(mentioned_hosts[:4]))
+
+    recommended_hosts = analysis.get("recommended_hosts", [])
+    candidate_reasons = analysis.get("candidate_reasons", {})
+    if recommended_hosts:
+        recommended_parts: list[str] = []
+        for hostname in recommended_hosts[:5]:
+            reasons = candidate_reasons.get(hostname, [])
+            if reasons:
+                recommended_parts.append(f"{hostname} ({'; '.join(reasons[:2])})")
+            else:
+                recommended_parts.append(hostname)
+        lines.append("- recommended_start_hosts=" + " ; ".join(recommended_parts))
+
+    exact_owner_hosts: list[str] = []
+    exact_owner_interfaces: list[str] = []
+
+    for context in analysis.get("ip_contexts", []):
+        ip_value = context.get("ip", "")
+        exact_matches = context.get("exact_matches", [])
+        network_matches = context.get("network_matches", [])
+        if exact_matches:
+            lines.append(
+                f"- queried_ip={ip_value} exact_owner="
+                + " ; ".join(_format_interface_context(row) for row in exact_matches[:3])
+            )
+            for row in exact_matches:
+                hostname = str(row.get("hostname", "") or "").strip()
+                interface_name = str(row.get("interface_name", "") or "").strip()
+                if hostname and hostname not in exact_owner_hosts:
+                    exact_owner_hosts.append(hostname)
+                if interface_name and interface_name not in exact_owner_interfaces:
+                    exact_owner_interfaces.append(interface_name)
+        exact_keys = {
+            (str(row.get("hostname", "")), str(row.get("interface_name", "")))
+            for row in exact_matches
+        }
+        same_network_matches = [
+            row for row in network_matches
+            if (str(row.get("hostname", "")), str(row.get("interface_name", ""))) not in exact_keys
+        ]
+        if same_network_matches:
+            lines.append(
+                f"- queried_ip={ip_value} same_network_candidates="
+                + " ; ".join(_format_interface_context(row) for row in same_network_matches[:3])
+            )
+
+    for context in analysis.get("prefix_contexts", []):
+        prefix_value = context.get("normalized_prefix", "") or context.get("prefix", "")
+        exact_matches = context.get("exact_matches", [])
+        overlapping_matches = context.get("overlapping_matches", [])
+        if exact_matches:
+            lines.append(
+                f"- queried_prefix={prefix_value} exact_owner="
+                + " ; ".join(_format_interface_context(row) for row in exact_matches[:3])
+            )
+            for row in exact_matches:
+                hostname = str(row.get("hostname", "") or "").strip()
+                interface_name = str(row.get("interface_name", "") or "").strip()
+                if hostname and hostname not in exact_owner_hosts:
+                    exact_owner_hosts.append(hostname)
+                if interface_name and interface_name not in exact_owner_interfaces:
+                    exact_owner_interfaces.append(interface_name)
+        if overlapping_matches:
+            lines.append(
+                f"- queried_prefix={prefix_value} overlaps="
+                + " ; ".join(_format_interface_context(row) for row in overlapping_matches[:3])
+            )
+
+    return "\n".join(lines), {
+        "analysis": analysis,
+        "exact_owner_hosts": exact_owner_hosts,
+        "exact_owner_interfaces": exact_owner_interfaces,
+    }
+
+
+def _route_path_instruction(user_query: str, route_context_digest: str) -> str:
+    if not route_context_digest:
+        return ""
+    if not _ROUTING_QUERY_RE.search(user_query or ""):
+        return ""
+    return (
+        "For routing / best-path questions:\n"
+        "- explain the path in order from source toward destination.\n"
+        "- for each proven step, mention the egress interface, next hop, and "
+        "transit network or tunnel when the CLI evidence proves it.\n"
+        "- when the route context digest identifies an exact destination owner, "
+        "state the final destination as a complete device/interface phrase, not "
+        "just a bare IP.\n"
+        "- if answering in Thai, keep labels in Thai or neutral technical terms "
+        "consistently, and avoid half-translated fragments such as `target device`.\n"
+        "- if redistribution appears in the evidence, keep protocol statements "
+        "scoped to the device where that evidence was observed.\n"
+    )
+
+
+def _trace_symmetry_instruction(user_query: str, trace_symmetry_digest: str) -> str:
+    if not trace_symmetry_digest:
+        return ""
+    if not _TRACE_SYMMETRY_QUERY_RE.search(user_query or "") and "traceroute" not in (user_query or "").lower():
+        return ""
+    return (
+        "For forward/reverse traceroute comparison:\n"
+        "- compare the reverse traceroute after reversing its host/link sequence; "
+        "do NOT compare hop 1 forward to hop 1 reverse directly.\n"
+        "- different interface IPs on opposite ends of the same network can still "
+        "represent the same path.\n"
+        "- include the forward and reverse hop IPs in the explanation when the "
+        "evidence includes them, not just the final verdict.\n"
+        "- when possible, mention which forward hop matches which reverse hop "
+        "as the same underlying link or device pair.\n"
+        "- if the traceroute symmetry digest says `likely_symmetric`, do not call "
+        "it asymmetric just because the interface IPs differ by direction.\n"
+        "- if the digest says evidence is partial, say that explicitly instead of "
+        "forcing a symmetric/asymmetric verdict.\n"
+    )
+
+
+def _route_answer_needs_repair(
+    answer: str,
+    user_query: str,
+    route_context: dict[str, Any],
+) -> bool:
+    if not _ROUTING_QUERY_RE.search(user_query or ""):
+        return False
+
+    text = answer or ""
+    if not text:
+        return False
+
+    if _THAI_CHAR_RE.search(user_query or "") and _HALF_TRANSLATED_ROUTE_LABEL_RE.search(text):
+        return True
+
+    exact_owner_hosts = route_context.get("exact_owner_hosts", [])
+    exact_owner_interfaces = route_context.get("exact_owner_interfaces", [])
+    has_owner_host = any(host and host.lower() in text.lower() for host in exact_owner_hosts)
+    has_owner_interface = any(
+        interface_name and interface_name.lower() in text.lower()
+        for interface_name in exact_owner_interfaces
+    )
+
+    if exact_owner_hosts and not has_owner_host:
+        return True
+    if _ROUTE_DESTINATION_DETAIL_RE.search(user_query or "") and exact_owner_interfaces and not has_owner_interface:
+        return True
+    return False
+
+
+def _repair_route_answer(
+    *,
+    answer_llm: SupportsInvoke,
+    system_msg: SystemMessage,
+    candidate_answer: str,
+    route_context_digest: str,
+    evidence_digest: str,
+    user_query: str,
+) -> str:
+    repair_instruction = HumanMessage(
+        content=(
+            "[System: Route answer repair]\n"
+            "Rewrite the answer below so it matches the route evidence and reads naturally.\n"
+            "Write one final answer only.\n"
+            "Match the user's language.\n"
+            "Lead with the best-path verdict, then walk the path in order.\n"
+            "For each proven step, mention the egress interface, next hop, and "
+            "transit network or tunnel when evidence supports it.\n"
+            "When the route context digest identifies the exact destination owner, "
+            "state the final destination as a complete device/interface phrase.\n"
+            "If answering in Thai, keep labels in Thai or neutral technical terms "
+            "consistently and avoid mixed fragments such as `target device`.\n"
+            "Prefer wording like `ปลายทางคือ ...` rather than half-translated labels.\n"
+            f"Latest user request: {user_query}\n"
+            f"{route_context_digest}\n"
+            f"{evidence_digest}\n"
+            f"Candidate answer:\n{candidate_answer}"
+        )
+    )
+    repaired = answer_llm.invoke([system_msg, repair_instruction])
+    content = _THINK_RE.sub("", str(repaired.content or "")).strip()
+    return content or candidate_answer
+
+
+def _infer_traceroute_target_host(raw_content: str, metadata: dict[str, Any]) -> str:
+    args = metadata.get("tool_args", {})
+    target = str(args.get("target", "") or "").strip()
+    if target:
+        resolved = resolve_inventory_record(target)
+        if resolved:
+            return str(resolved.get("hostname", "") or "").strip()
+
+    resolved_match = _TRACE_RESOLVED_TARGET_RE.search(raw_content or "")
+    if resolved_match:
+        return resolved_match.group("host").strip()
+
+    target_match = _TRACE_TARGET_EXACT_OWNER_RE.search(raw_content or "")
+    if target_match:
+        return target_match.group("host").strip()
+
+    return ""
+
+
+def _normalize_path_nodes(nodes: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for node in nodes:
+        cleaned = str(node or "").strip()
+        if not cleaned:
+            continue
+        if normalized and normalized[-1].lower() == cleaned.lower():
+            continue
+        normalized.append(cleaned)
+    return normalized
+
+
+def _first_host_match(pattern: re.Pattern[str], text: str) -> str:
+    match = pattern.search(text or "")
+    if not match:
+        return ""
+    return str(match.group("host") or "").strip()
+
+
+def _parse_traceroute_hop_details(raw_content: str) -> list[dict[str, Any]]:
+    details: list[dict[str, Any]] = []
+    for match in _TRACE_HOP_ANNOTATION_RE.finditer(raw_content or ""):
+        hop_number = int(match.group("hop"))
+        body = match.group("body").strip()
+        ip_match = _TRACE_HOP_IP_RE.search(body)
+        hop_ip = ip_match.group("ip").strip() if ip_match else ""
+        exact_host = _first_host_match(_TRACE_EXACT_HOST_RE, body)
+        same_network_host = _first_host_match(_TRACE_SAME_NETWORK_HOST_RE, body)
+        if not same_network_host:
+            same_network_host = _first_host_match(_TRACE_CONNECTED_CANDIDATE_HOST_RE, body)
+        link_nodes = sorted({
+            host for host in (exact_host, same_network_host)
+            if host
+        })
+        details.append({
+            "hop": hop_number,
+            "ip": hop_ip,
+            "body": body,
+            "exact_host": exact_host,
+            "same_network_host": same_network_host,
+            "link_signature": tuple(link_nodes),
+        })
+    return details
+
+
+def _path_link_sequence(nodes: list[str]) -> list[tuple[str, str]]:
+    links: list[tuple[str, str]] = []
+    for left, right in zip(nodes, nodes[1:]):
+        left_clean = str(left or "").strip()
+        right_clean = str(right or "").strip()
+        if not left_clean or not right_clean or left_clean.lower() == right_clean.lower():
+            continue
+        links.append(tuple(sorted((left_clean, right_clean))))
+    return links
+
+
+def _extract_traceroute_items(result_messages: list[BaseMessage]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for message in result_messages:
+        if not isinstance(message, ToolMessage) or getattr(message, "name", "") != "run_diagnostic":
+            continue
+        metadata = getattr(message, "additional_kwargs", {}) or {}
+        args = metadata.get("tool_args", {})
+        if str(args.get("kind", "") or "").strip().lower() != "traceroute":
+            continue
+        if str(metadata.get("tool_status", "") or "").strip() != "success":
+            continue
+
+        raw_content = str(message.content or "")
+        requested_source = str(args.get("host", "") or "").strip()
+        parsed_host, _ip, _os_type, _body = parse_output(raw_content)
+        source_host = parsed_host or requested_source
+        target_host = _infer_traceroute_target_host(raw_content, metadata)
+        hop_details = _parse_traceroute_hop_details(raw_content)
+        hop_hosts = [
+            detail["exact_host"]
+            for detail in hop_details
+            if detail.get("exact_host")
+        ]
+
+        nodes = _normalize_path_nodes([source_host, *hop_hosts])
+        if target_host and (not nodes or nodes[-1].lower() != target_host.lower()):
+            nodes = _normalize_path_nodes([*nodes, target_host])
+
+        if len(nodes) < 2:
+            continue
+
+        items.append({
+            "source_host": source_host,
+            "target_host": target_host,
+            "nodes": nodes,
+            "links": _path_link_sequence(nodes),
+            "hop_details": hop_details,
+        })
+    return items
+
+
+def _assess_traceroute_symmetry(result_messages: list[BaseMessage]) -> tuple[str, list[dict[str, Any]]]:
+    traceroutes = _extract_traceroute_items(result_messages)
+    if len(traceroutes) < 2:
+        return "", []
+
+    analyses: list[dict[str, Any]] = []
+    used_indexes: set[int] = set()
+
+    for index, item in enumerate(traceroutes):
+        if index in used_indexes:
+            continue
+        source_host = item["source_host"]
+        target_host = item["target_host"]
+        if not source_host or not target_host:
+            continue
+
+        match_index = None
+        for candidate_index in range(index + 1, len(traceroutes)):
+            if candidate_index in used_indexes:
+                continue
+            candidate = traceroutes[candidate_index]
+            if (
+                candidate["source_host"].lower() == target_host.lower()
+                and candidate["target_host"].lower() == source_host.lower()
+            ):
+                match_index = candidate_index
+                break
+
+        if match_index is None:
+            continue
+
+        used_indexes.add(index)
+        used_indexes.add(match_index)
+        reverse_item = traceroutes[match_index]
+        forward_nodes = item["nodes"]
+        reverse_nodes = reverse_item["nodes"]
+        forward_links = item["links"]
+        reverse_links = reverse_item["links"]
+        forward_hops = item.get("hop_details", [])
+        reverse_hops = reverse_item.get("hop_details", [])
+
+        verdict = "insufficient_evidence"
+        reason = (
+            "reverse traceroute exists, but the host/link sequence does not prove a full "
+            "symmetric comparison yet"
+        )
+        if forward_hops and reverse_hops:
+            forward_link_signatures = [
+                tuple(detail.get("link_signature", ()))
+                for detail in forward_hops
+                if detail.get("link_signature")
+            ]
+            reverse_link_signatures = [
+                tuple(detail.get("link_signature", ()))
+                for detail in reverse_hops
+                if detail.get("link_signature")
+            ]
+            if forward_link_signatures and forward_link_signatures == list(reversed(reverse_link_signatures)):
+                verdict = "likely_symmetric"
+                reason = "forward hop links match the reverse traceroute when compared as reversed links"
+        if verdict == "insufficient_evidence" and forward_nodes and reverse_nodes and all(
+            left.lower() == right.lower()
+            for left, right in zip(forward_nodes, list(reversed(reverse_nodes)))
+        ) and len(forward_nodes) == len(reverse_nodes):
+            verdict = "likely_symmetric"
+            reason = "forward host path matches the reverse traceroute when read backwards"
+        elif verdict == "insufficient_evidence" and forward_links and reverse_links and forward_links == list(reversed(reverse_links)):
+            verdict = "likely_symmetric"
+            reason = "forward link sequence matches the reverse traceroute when read backwards"
+        elif forward_links and reverse_links and set(forward_links).isdisjoint(set(reverse_links)):
+            verdict = "likely_asymmetric"
+            reason = "forward and reverse traces do not share any common link segments"
+
+        analyses.append({
+            "forward": item,
+            "reverse": reverse_item,
+            "verdict": verdict,
+            "reason": reason,
+        })
+
+    if not analyses:
+        return "", []
+
+    lines = ["[Traceroute Symmetry Digest]"]
+    for analysis in analyses:
+        forward = analysis["forward"]
+        reverse = analysis["reverse"]
+        forward_nodes = forward["nodes"]
+        reverse_nodes = reverse["nodes"]
+        forward_links = forward["links"]
+        reverse_links = reverse["links"]
+        lines.append(
+            f"- pair={forward['source_host']} -> {forward['target_host']} | "
+            f"reverse={reverse['source_host']} -> {reverse['target_host']}"
+        )
+        lines.append("- forward_path_hosts=" + " -> ".join(forward_nodes))
+        lines.append("- reverse_path_hosts=" + " -> ".join(reverse_nodes))
+        forward_hops = forward.get("hop_details", [])
+        reverse_hops = reverse.get("hop_details", [])
+        if forward_hops:
+            lines.append(
+                "- forward_hops="
+                + " ; ".join(
+                    f"{detail['hop']}:{detail.get('ip', '?')}/{detail.get('exact_host', '?')}"
+                    for detail in forward_hops
+                )
+            )
+        if reverse_hops:
+            lines.append(
+                "- reverse_hops="
+                + " ; ".join(
+                    f"{detail['hop']}:{detail.get('ip', '?')}/{detail.get('exact_host', '?')}"
+                    for detail in reverse_hops
+                )
+            )
+        lines.append(f"- verdict={analysis['verdict']}")
+        lines.append(f"- reason={analysis['reason']}")
+        if analysis["verdict"] == "likely_symmetric":
+            matched_links = [
+                f"{left} <-> {right}"
+                for left, right in forward_links
+            ]
+            if matched_links:
+                lines.append("- matched_links=" + " ; ".join(matched_links))
+            mirrored_hops: list[str] = []
+            for forward_detail, reverse_detail in zip(forward_hops, list(reversed(reverse_hops))):
+                left_signature = tuple(forward_detail.get("link_signature", ()))
+                right_signature = tuple(reverse_detail.get("link_signature", ()))
+                if not left_signature or left_signature != right_signature:
+                    continue
+                mirrored_hops.append(
+                    f"f{forward_detail['hop']} {forward_detail.get('ip', '?')}/{forward_detail.get('exact_host', '?')} "
+                    f"<-> r{reverse_detail['hop']} {reverse_detail.get('ip', '?')}/{reverse_detail.get('exact_host', '?')} "
+                    f"via {' <-> '.join(left_signature)}"
+                )
+            if mirrored_hops:
+                lines.append("- mirrored_hops=" + " ; ".join(mirrored_hops))
+        elif analysis["verdict"] == "likely_asymmetric":
+            lines.append(
+                "- forward_links=" + " ; ".join(f"{left} <-> {right}" for left, right in forward_links)
+            )
+            lines.append(
+                "- reverse_links=" + " ; ".join(f"{left} <-> {right}" for left, right in reverse_links)
+            )
+
+    return "\n".join(lines), analyses
 
 
 def _build_evidence_digest(result_messages: list[BaseMessage]) -> str:
@@ -1135,7 +2204,7 @@ def _build_evidence_digest(result_messages: list[BaseMessage]) -> str:
         body = item["body"]
         reason = ""
         if status == "error":
-            first_line = body.splitlines()[0].strip()
+            first_line = strip_tool_metadata(body).splitlines()[0].strip()
             reason = first_line
         run_cli_items.append((resolved_host, status, command or reason))
         if status == "success":
@@ -1177,6 +2246,9 @@ def _build_evidence_digest(result_messages: list[BaseMessage]) -> str:
         lines.append("[Logical Relationship Digest]")
         for protocol, left, right in sorted(logical_links):
             lines.append(f"- protocol={protocol}, {left} <-> {right}")
+    traceroute_symmetry_digest, _analyses = _assess_traceroute_symmetry(result_messages)
+    if traceroute_symmetry_digest:
+        lines.append(traceroute_symmetry_digest)
     return "\n".join(lines)
 
 
@@ -1504,6 +2576,67 @@ def _repair_answer_with_exact_facts(
             f"Latest user request: {user_query}\n"
             f"Exact totals: success={stats['success']}, error={stats['error']}, total={stats['total']}\n"
             f"Failed hosts:\n{failed_lines}\n"
+            f"{evidence_digest}\n"
+            f"Candidate answer:\n{candidate_answer}"
+        )
+    )
+    repaired = answer_llm.invoke([system_msg, repair_instruction])
+    content = _THINK_RE.sub("", str(repaired.content or "")).strip()
+    return content or candidate_answer
+
+
+def _trace_symmetry_answer_needs_repair(
+    answer: str,
+    user_query: str,
+    analyses: list[dict[str, Any]],
+) -> bool:
+    if not analyses:
+        return False
+    if not _TRACE_SYMMETRY_QUERY_RE.search(user_query or "") and "traceroute" not in (user_query or "").lower():
+        return False
+
+    text = answer or ""
+    has_symmetric_verdict = any(item.get("verdict") == "likely_symmetric" for item in analyses)
+    has_asymmetric_verdict = any(item.get("verdict") == "likely_asymmetric" for item in analyses)
+    mentions_ip_details = bool(_ANY_IP_RE.search(text))
+
+    if has_symmetric_verdict and _ASYMMETRIC_VERDICT_RE.search(text):
+        return True
+    if has_asymmetric_verdict and _SYMMETRIC_VERDICT_RE.search(text) and not _ASYMMETRIC_VERDICT_RE.search(text):
+        return True
+    if analyses and not mentions_ip_details:
+        return True
+    return False
+
+
+def _repair_trace_symmetry_answer(
+    *,
+    answer_llm: SupportsInvoke,
+    system_msg: SystemMessage,
+    candidate_answer: str,
+    trace_symmetry_digest: str,
+    evidence_digest: str,
+    user_query: str,
+) -> str:
+    repair_instruction = HumanMessage(
+        content=(
+            "[System: Traceroute symmetry repair]\n"
+            "Rewrite the answer below so it matches the traceroute symmetry evidence.\n"
+            "Write one final answer only.\n"
+            "Match the user's language.\n"
+            "Lead with the verdict, then explain the evidence briefly.\n"
+            "For forward/reverse traceroute comparison, compare the reverse path "
+            "after reversing its host/link sequence.\n"
+            "Do not call a path asymmetric just because opposite interface IPs "
+            "appear on the same links in opposite directions.\n"
+            "Include the forward and reverse hop IPs in the answer.\n"
+            "Prefer short hop-by-hop bullets or concise hop lists for each direction.\n"
+            "If the digest says `likely_symmetric`, explain that the traces show "
+            "the same path in reverse.\n"
+            "If the digest says `likely_asymmetric`, explain which links differ.\n"
+            "If the digest is incomplete, say so explicitly.\n"
+            f"Latest user request: {user_query}\n"
+            f"{trace_symmetry_digest}\n"
             f"{evidence_digest}\n"
             f"Candidate answer:\n{candidate_answer}"
         )

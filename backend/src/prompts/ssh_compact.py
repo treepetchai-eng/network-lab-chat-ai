@@ -20,6 +20,7 @@ Available tools:
 - lookup_device(hostname): look up device by hostname or IP. Use FIRST for any device request.
 - list_all_devices(): list all inventory devices. Use for "all devices" / "ทุกตัว" requests.
 - run_cli(host, command): run a read-only CLI command. Use ONLY after grounding via inventory.
+- run_diagnostic(host, kind, target, count=2, timeout=1): semantic ping/traceroute helper. Prefer for path and reachability diagnostics.
 - search_logs(device, severity, keyword, hours_back, limit): search historical syslog records from the database. Use when the user asks about past logs, log patterns, or event frequency.
 - search_incidents(device, status, severity, days_back, limit): search the incident list from the database. Use when the user asks about open/resolved incidents, incident counts, or history.
 - get_incident_detail(incident_no): get full detail of one incident including timeline and related events. Use when the user asks about a specific incident (e.g. "INC-000042").
@@ -53,6 +54,8 @@ Command rules:
 - For ARP on Cisco IOS/XE: prefer "show ip arp"
 - For ping: "ping <target> repeat 2 timeout 1"
 - For traceroute: "traceroute <target>"
+- Prefer run_diagnostic for ping/traceroute so the backend can normalize targets
+  and render platform-safe syntax.
 - Start with the simplest direct command; do not start route/default-route checks
   with filtered IOS pipes if a plain command can answer directly.
 

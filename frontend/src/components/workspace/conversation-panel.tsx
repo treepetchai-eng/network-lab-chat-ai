@@ -22,15 +22,62 @@ interface ConversationPanelProps {
 
 export function ConversationPanel({ messages, isStreaming, currentStatus, statusHistory, currentProgress, phase, currentSteps, streamingTokens, pendingFinalContent, onStreamingComplete, onSuggestion }: ConversationPanelProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const stickToBottomRef = useRef(true);
+  const scrollRafRef = useRef<number | null>(null);
+  const lastStreamScrollAtRef = useRef(0);
 
   useEffect(() => {
     const node = scrollRef.current;
     if (!node) return;
-    node.scrollTo({
-      top: node.scrollHeight,
-      behavior: messages.length > 0 ? "smooth" : "auto",
+
+    const updateStickiness = () => {
+      const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+      stickToBottomRef.current = distanceFromBottom < 140;
+    };
+
+    updateStickiness();
+    node.addEventListener("scroll", updateStickiness, { passive: true });
+    return () => {
+      node.removeEventListener("scroll", updateStickiness);
+    };
+  }, []);
+
+  useEffect(() => {
+    const node = scrollRef.current;
+    if (!node || !stickToBottomRef.current) return;
+
+    if (scrollRafRef.current) {
+      cancelAnimationFrame(scrollRafRef.current);
+      scrollRafRef.current = null;
+    }
+
+    const shouldThrottle = isStreaming && streamingTokens.length > 0;
+    const behavior = shouldThrottle ? "auto" : messages.length > 0 ? "smooth" : "auto";
+
+    if (shouldThrottle) {
+      const now = performance.now();
+      if (now - lastStreamScrollAtRef.current < 80) {
+        return;
+      }
+    }
+
+    scrollRafRef.current = requestAnimationFrame(() => {
+      if (shouldThrottle) {
+        lastStreamScrollAtRef.current = performance.now();
+        node.scrollTop = node.scrollHeight;
+      } else {
+        node.scrollTo({ top: node.scrollHeight, behavior });
+      }
+      scrollRafRef.current = null;
     });
-  }, [messages.length, isStreaming, streamingTokens, currentSteps.length]);
+
+    return () => {
+      if (scrollRafRef.current) {
+        cancelAnimationFrame(scrollRafRef.current);
+        scrollRafRef.current = null;
+      }
+    };
+  }, [messages.length, isStreaming, streamingTokens.length, currentSteps.length]);
 
   return (
     <motion.section

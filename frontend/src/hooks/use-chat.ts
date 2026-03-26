@@ -1,5 +1,5 @@
 "use client";
-import { useCallback, useEffect, useReducer, useRef } from "react";
+import { startTransition, useCallback, useEffect, useReducer, useRef } from "react";
 import { parseSSELine } from "@/lib/sse-parser";
 import { SSE_EVENTS } from "@/lib/constants";
 import { sendMessageStream } from "@/lib/api";
@@ -29,22 +29,46 @@ const initialState: ChatState = {
   error: null,
 };
 
+function sameProgress(a: ChatState["currentProgress"], b: ChatState["currentProgress"]) {
+  if (a === b) {
+    return true;
+  }
+  if (!a || !b) {
+    return false;
+  }
+  return a.current === b.current && a.total === b.total;
+}
+
 function chatReducer(state: ChatState, action: ChatAction): ChatState {
   switch (action.type) {
     case "SET_SESSION":
+      if (state.sessionId === action.sessionId) {
+        return state;
+      }
       return { ...state, sessionId: action.sessionId };
     case "ADD_USER_MESSAGE":
       return { ...state, messages: [...state.messages, action.message] };
     case "SET_STREAMING":
+      if (state.isStreaming === action.isStreaming) {
+        return state;
+      }
       return { ...state, isStreaming: action.isStreaming };
     case "SET_STATUS":
       if (!action.text) {
-        return { ...state, currentStatus: null, currentProgress: action.progress ?? null };
+        const nextProgress = action.progress ?? null;
+        if (state.currentStatus === null && sameProgress(state.currentProgress, nextProgress)) {
+          return state;
+        }
+        return { ...state, currentStatus: null, currentProgress: nextProgress };
       }
       if (state.currentStatus === action.text) {
+        const nextProgress = action.progress ?? state.currentProgress;
+        if (sameProgress(state.currentProgress, nextProgress)) {
+          return state;
+        }
         return {
           ...state,
-          currentProgress: action.progress ?? state.currentProgress,
+          currentProgress: nextProgress,
         };
       }
       return {
@@ -56,6 +80,9 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
     case "ADD_STEP":
       return { ...state, currentSteps: [...state.currentSteps, action.step] };
     case "APPEND_TOKEN":
+      if (!action.token) {
+        return state;
+      }
       return { ...state, streamingTokens: state.streamingTokens + action.token };
     case "FINALIZE_ASSISTANT": {
       // When tokens were already streamed live, the animation is already
@@ -149,6 +176,9 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
       };
     }
     case "SET_ERROR":
+      if (state.error === action.error && (!action.error || state.isStreaming === false)) {
+        return state;
+      }
       return {
         ...state,
         error: action.error,
@@ -166,11 +196,44 @@ export function useChat() {
   const abortRef = useRef<AbortController | null>(null);
   const isSendingRef = useRef(false);
   const safetyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const tokenBufferRef = useRef("");
+  const tokenFlushTimerRef = useRef<number | null>(null);
+
+  const flushBufferedTokens = useCallback(() => {
+    if (tokenFlushTimerRef.current !== null) {
+      window.clearTimeout(tokenFlushTimerRef.current);
+      tokenFlushTimerRef.current = null;
+    }
+
+    if (!tokenBufferRef.current) {
+      return;
+    }
+
+    const tokenChunk = tokenBufferRef.current;
+    tokenBufferRef.current = "";
+
+    startTransition(() => {
+      dispatch({ type: "APPEND_TOKEN", token: tokenChunk });
+    });
+  }, []);
+
+  const scheduleTokenFlush = useCallback(() => {
+    if (tokenFlushTimerRef.current !== null) {
+      return;
+    }
+
+    tokenFlushTimerRef.current = window.setTimeout(() => {
+      flushBufferedTokens();
+    }, 32);
+  }, [flushBufferedTokens]);
 
   useEffect(() => {
     return () => {
       abortRef.current?.abort();
       if (safetyTimerRef.current) clearTimeout(safetyTimerRef.current);
+      if (tokenFlushTimerRef.current !== null) {
+        window.clearTimeout(tokenFlushTimerRef.current);
+      }
     };
   }, []);
 
@@ -183,6 +246,11 @@ export function useChat() {
     isSendingRef.current = true;
 
     abortRef.current?.abort();
+    tokenBufferRef.current = "";
+    if (tokenFlushTimerRef.current !== null) {
+      window.clearTimeout(tokenFlushTimerRef.current);
+      tokenFlushTimerRef.current = null;
+    }
 
     const userMsg: ChatMessage = {
       id: uid(),
@@ -250,10 +318,12 @@ export function useChat() {
             case SSE_EVENTS.ANALYST_TOKEN: {
               const d = evt.data as AnalystTokenEvent;
               dispatch({ type: "SET_STATUS", text: null });
-              dispatch({ type: "APPEND_TOKEN", token: d.token });
+              tokenBufferRef.current += d.token;
+              scheduleTokenFlush();
               break;
             }
             case SSE_EVENTS.ANALYST_DONE: {
+              flushBufferedTokens();
               const d = evt.data as AnalystDoneEvent;
               dispatch({ type: "FINALIZE_ASSISTANT", content: d.full_content });
               receivedDone = true;
@@ -270,10 +340,12 @@ export function useChat() {
             }
             case SSE_EVENTS.ERROR: {
               const d = evt.data as ErrorEvent;
+              flushBufferedTokens();
               dispatch({ type: "SET_ERROR", error: d.message });
               break;
             }
             case SSE_EVENTS.DONE:
+              flushBufferedTokens();
               receivedDone = true;
               dispatch({ type: "SET_STREAMING", isStreaming: false });
               break;
@@ -281,19 +353,26 @@ export function useChat() {
         }
       }
     } catch (err) {
+      flushBufferedTokens();
       if (err instanceof Error && err.name !== "AbortError") {
         dispatch({ type: "SET_ERROR", error: err.message });
       }
     } finally {
+      flushBufferedTokens();
       if (!receivedDone) {
         dispatch({ type: "FINALIZE_ORPHAN" });
       }
       isSendingRef.current = false;
     }
-  }, []);
+  }, [flushBufferedTokens, scheduleTokenFlush]);
 
   const resetChat = useCallback(() => {
     abortRef.current?.abort();
+    tokenBufferRef.current = "";
+    if (tokenFlushTimerRef.current !== null) {
+      window.clearTimeout(tokenFlushTimerRef.current);
+      tokenFlushTimerRef.current = null;
+    }
     isSendingRef.current = false;
     dispatch({ type: "RESET_CHAT" });
   }, []);

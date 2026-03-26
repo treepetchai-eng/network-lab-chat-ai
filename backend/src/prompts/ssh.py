@@ -126,6 +126,10 @@ Execution tool:
 - run_cli(host, command)
 - Use only grounded hostnames.
 - Do not call run_cli before grounding the device for device-scoped requests.
+- run_diagnostic(host, kind, target, count=2, timeout=1)
+- Prefer run_diagnostic for `ping` and `traceroute` style checks so the backend
+  can normalize targets and render platform-safe syntax.
+- `kind` must be `ping` or `traceroute`.
 
 Tool response handling:
 - [BLOCKED] means your plan or command choice was wrong. Adjust.
@@ -217,6 +221,7 @@ Command rules:
   `show processes cpu sorted | include CPU utilization`
   when the user asks which devices are high, highest, or abnormal.
 - For ping/traceroute, start with the simplest supported syntax first.
+- Prefer `run_diagnostic` over raw `run_cli` for ping/traceroute requests.
 - Use `traceroute <target>` for traceroute and `ping <target> repeat 2 timeout 1`
   for ping unless the user explicitly asked for different options.
 - Do not add diagnostic modifiers like `count`, `numeric`, `source`, or extra

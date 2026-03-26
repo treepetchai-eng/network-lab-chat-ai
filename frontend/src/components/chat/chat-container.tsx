@@ -11,7 +11,7 @@ import { StickyComposer } from "@/components/workspace/sticky-composer";
 import { TopHeader } from "@/components/workspace/top-header";
 
 export function ChatContainer() {
-  const [draftValue, setDraftValue] = useState("");
+  const [isUserTyping, setIsUserTyping] = useState(false);
   const { sessionId, isLoading: sessionLoading, resetSession } = useSession();
   const {
     messages,
@@ -40,7 +40,7 @@ export function ChatContainer() {
       if (!sessionId) {
         return;
       }
-      setDraftValue("");
+      setIsUserTyping(false);
       sendMessage(sessionId, text);
     },
     [sendMessage, sessionId],
@@ -114,8 +114,8 @@ export function ChatContainer() {
         pendingFinalContent={pendingFinalContent}
         onStreamingComplete={commitFinalize}
         onSuggestion={handleSend}
-        isUserTyping={draftValue.trim().length > 0}
-        composer={<StickyComposer onSend={handleSend} disabled={isStreaming} onDraftChange={setDraftValue} />}
+        isUserTyping={isUserTyping}
+        composer={<StickyComposer onSend={handleSend} disabled={isStreaming} onDraftPresenceChange={setIsUserTyping} />}
       />
     </AppShell>
   );

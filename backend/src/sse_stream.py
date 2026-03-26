@@ -14,6 +14,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, Too
 logger = logging.getLogger(__name__)
 
 from src.formatters import (
+    extract_executed_command,
     fmt_cli_error,
     fmt_cli_output,
     fmt_device_list,
@@ -33,6 +34,7 @@ _MAX_CHUNK = 48
 _SHORT_DELAY = 0.002
 _MID_DELAY = 0.001
 _LONG_DELAY = 0.0
+_EXECUTION_TOOL_NAMES = {"run_cli", "run_diagnostic"}
 
 
 # ---------------------------------------------------------------------------
@@ -97,10 +99,20 @@ async def stream_chat(
         "recursion_limit": 50,
     }
     inputs = {
-        "messages": [HumanMessage(content=user_message)],
+        "messages": [
+            *(
+                list(getattr(session, "preloaded_messages", []))
+                if getattr(session, "preloaded_messages", None)
+                and not getattr(session, "preloaded_seeded", False)
+                else []
+            ),
+            HumanMessage(content=user_message),
+        ],
         "device_cache": session.device_cache,
-        "incident_context": session.incident_context,
+        "incident_context": getattr(session, "incident_context", "") or "",
     }
+    if getattr(session, "preloaded_messages", None) and not getattr(session, "preloaded_seeded", False):
+        session.preloaded_seeded = True
 
     last_command = ""
     pending_commands: dict[str, dict[str, str]] = {}  # tool_call_id → metadata
@@ -178,14 +190,19 @@ async def stream_chat(
                 if isinstance(msg, AIMessage) and getattr(
                     msg, "tool_calls", None
                 ):
-                    run_cli_calls = [
+                    execution_calls = [
                         tc for tc in msg.tool_calls
-                        if tc.get("name", "") == "run_cli"
+                        if tc.get("name", "") in _EXECUTION_TOOL_NAMES
                     ]
-                    if run_cli_calls:
-                        for tc in run_cli_calls:
+                    if execution_calls:
+                        for tc in execution_calls:
                             args = tc.get("args", {})
-                            last_command = args.get("command", "?")
+                            if tc.get("name") == "run_diagnostic":
+                                diag_kind = str(args.get("kind", "") or "").strip().lower()
+                                diag_target = str(args.get("target", "") or "").strip()
+                                last_command = f"{diag_kind} {diag_target}".strip() or "diagnostic"
+                            else:
+                                last_command = args.get("command", "?")
                             host = args.get("host", "")
                             call_id = tc.get("id", "")
                             if call_id:
@@ -193,28 +210,33 @@ async def stream_chat(
                                     "command": last_command,
                                     "host": host,
                                 }
-                        ssh_device_count += len(run_cli_calls)
-                        if len(run_cli_calls) > 1:
+                        ssh_device_count += len(execution_calls)
+                        if len(execution_calls) > 1:
                             command_set = {
-                                str(tc.get("args", {}).get("command", "") or "").strip()
-                                for tc in run_cli_calls
+                                (
+                                    f"{str(tc.get('args', {}).get('kind', '') or '').strip().lower()} "
+                                    f"{str(tc.get('args', {}).get('target', '') or '').strip()}".strip()
+                                    if tc.get("name") == "run_diagnostic"
+                                    else str(tc.get("args", {}).get("command", "") or "").strip()
+                                )
+                                for tc in execution_calls
                             }
                             if len(command_set) == 1:
                                 batch_command = next(iter(command_set)) or "CLI checks"
                                 text = (
                                     f"Running `{batch_command}` on "
-                                    f"{len(run_cli_calls)} devices in parallel ..."
+                                    f"{len(execution_calls)} devices in parallel ..."
                                 )
                             else:
                                 text = (
-                                    f"Running {len(run_cli_calls)} CLI checks "
+                                    f"Running {len(execution_calls)} execution checks "
                                     "in parallel ..."
                                 )
                             yield _sse(
                                 "status",
                                 text=text,
-                                tool_name="run_cli",
-                                args={"current": 0, "total": len(run_cli_calls)},
+                                tool_name="run_diagnostic",
+                                args={"current": 0, "total": len(execution_calls)},
                             )
 
                     for tc in msg.tool_calls:
@@ -238,20 +260,26 @@ async def stream_chat(
                                 args=args,
                             )
 
-                        elif name == "run_cli":
-                            if len(run_cli_calls) <= 1:
-                                last_command = args.get("command", "?")
+                        elif name in _EXECUTION_TOOL_NAMES:
+                            if len(execution_calls) <= 1:
+                                if name == "run_diagnostic":
+                                    last_command = (
+                                        f"{str(args.get('kind', '') or '').strip().lower()} "
+                                        f"{str(args.get('target', '') or '').strip()}"
+                                    ).strip() or "diagnostic"
+                                else:
+                                    last_command = args.get("command", "?")
                                 host = args.get("host", "")
                                 text = (
                                     f"Running `{last_command}`"
                                     f" on {host} ..."
                                 )
                                 yield _sse(
-                                "status",
-                                text=text,
-                                tool_name="run_cli",
-                                args={"current": 0, "total": 1, **args},
-                            )
+                                    "status",
+                                    text=text,
+                                    tool_name=name,
+                                    args={"current": 0, "total": 1, **args},
+                                )
 
                 # ToolMessage → formatted tool result
                 elif isinstance(msg, ToolMessage):
@@ -270,14 +298,14 @@ async def stream_chat(
                         )
                         sent_reviewing_status = True
 
-                    if tool_name == "run_cli":
+                    if tool_name in _EXECUTION_TOOL_NAMES:
                         ssh_result_count += 1
                         hostname, ip, os_type, body = parse_output(raw)
                         is_err = is_error(body)
                         # Resolve command from pending_commands map (batch-safe)
                         call_id = getattr(msg, "tool_call_id", "")
                         pending = pending_commands.pop(call_id, {})
-                        cmd = pending.get("command", last_command)
+                        cmd = extract_executed_command(raw) or pending.get("command", last_command)
                         pending_host = pending.get("host", "")
                         if not hostname and pending_host:
                             hostname = pending_host
@@ -310,9 +338,9 @@ async def stream_chat(
                                 "status",
                                 text=(
                                     f"Collected {ssh_result_count}/{ssh_device_count} "
-                                    "CLI results ..."
+                                    "execution results ..."
                                 ),
-                                tool_name="run_cli",
+                                tool_name=tool_name,
                                 args={"current": ssh_result_count, "total": ssh_device_count},
                             )
 
@@ -333,8 +361,13 @@ async def stream_chat(
                                 "site": parsed.get("site", ""),
                             }
 
+                        resolved_via = parsed.get("resolved_via", "")
                         step_name = (
-                            f"Found {parsed.get('hostname', '?')}"
+                            (
+                                f"Found {parsed.get('hostname', '?')} via interface IP"
+                                if found and resolved_via == "interface_ip"
+                                else f"Found {parsed.get('hostname', '?')}"
+                            )
                             if found
                             else "Device not found"
                         )

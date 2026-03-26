@@ -116,11 +116,11 @@ export function DashboardClient({ initialDashboard, initialLogs }: Props) {
           sub="Open threads"
         />
         <MetricCard
-          label="Recovering"
+          label="Recovery Watch"
           value={m.recovering_incidents}
           icon={TrendingUp}
           variant={m.recovering_incidents > 0 ? "warning" : "default"}
-          sub="Pending verification"
+          sub="Recovering + monitoring"
         />
         <MetricCard
           label="Pending Approval"

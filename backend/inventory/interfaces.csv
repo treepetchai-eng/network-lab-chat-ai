@@ -1,0 +1,67 @@
+hostname,mgmt_ip,site,device_role,os_platform,interface_name,parent_interface,description,interface_mode,access_vlan,native_vlan,vlan_tag,ip_address,netmask,prefix_length,cidr,network,network_cidr
+BRANCH-A-RTR,10.255.3.101,BRANCH-A,router,cisco_ios,GigabitEthernet0/0,,test,,,,,,,,,,
+BRANCH-A-RTR,10.255.3.101,BRANCH-A,router,cisco_ios,GigabitEthernet0/1,,TO-provider1-circuit VLAN101,routed,,,,100.64.1.2,255.255.255.252,30,100.64.1.2/30,100.64.1.0,100.64.1.0/30
+BRANCH-A-RTR,10.255.3.101,BRANCH-A,router,cisco_ios,GigabitEthernet0/2,,TO-provider2-circuit VLAN201,routed,,,,100.65.1.2,255.255.255.252,30,100.65.1.2/30,100.65.1.0,100.65.1.0/30
+BRANCH-A-RTR,10.255.3.101,BRANCH-A,router,cisco_ios,GigabitEthernet0/3,,TO-BRANCH-A-Switch Gi0/1 (TRUNK),subinterface_parent,,,,,,,,,
+BRANCH-A-RTR,10.255.3.101,BRANCH-A,router,cisco_ios,GigabitEthernet0/3.10,GigabitEthernet0/3,VLAN10 MARKETING-A,subinterface,,,10,192.168.10.1,255.255.255.0,24,192.168.10.1/24,192.168.10.0,192.168.10.0/24
+BRANCH-A-RTR,10.255.3.101,BRANCH-A,router,cisco_ios,GigabitEthernet0/3.20,GigabitEthernet0/3,VLAN20 FINANCE-A,subinterface,,,20,192.168.20.1,255.255.255.0,24,192.168.20.1/24,192.168.20.0,192.168.20.0/24
+BRANCH-A-RTR,10.255.3.101,BRANCH-A,router,cisco_ios,GigabitEthernet0/3.99,GigabitEthernet0/3,VLAN99 MANAGEMENT-A (SW-MGMT),subinterface,,,99,192.168.99.1,255.255.255.0,24,192.168.99.1/24,192.168.99.0,192.168.99.0/24
+BRANCH-A-RTR,10.255.3.101,BRANCH-A,router,cisco_ios,Loopback0,,BRANCH-A-LOOPBACK,loopback,,,,10.255.3.101,255.255.255.255,32,10.255.3.101/32,10.255.3.101,10.255.3.101/32
+BRANCH-A-RTR,10.255.3.101,BRANCH-A,router,cisco_ios,Tunnel10,,HQ-DIST1 via VLAN101 (PRIMARY),tunnel,,,,172.16.10.2,255.255.255.252,30,172.16.10.2/30,172.16.10.0,172.16.10.0/30
+BRANCH-A-RTR,10.255.3.101,BRANCH-A,router,cisco_ios,Tunnel20,,HQ-DIST2 via VLAN201 (BACKUP),tunnel,,,,172.16.20.2,255.255.255.252,30,172.16.20.2/30,172.16.20.0,172.16.20.0/30
+BRANCH-A-Switch,192.168.99.11,BRANCH-A,access_switch,cisco_ios,GigabitEthernet0/0,,,access,1,,,,,,,,
+BRANCH-A-Switch,192.168.99.11,BRANCH-A,access_switch,cisco_ios,GigabitEthernet0/1,,UPLINK -> BRANCH-A-RTR Gi0/3,trunk,,1,,,,,,,
+BRANCH-A-Switch,192.168.99.11,BRANCH-A,access_switch,cisco_ios,GigabitEthernet0/2,,PC-marketing,access,10,,,,,,,,
+BRANCH-A-Switch,192.168.99.11,BRANCH-A,access_switch,cisco_ios,GigabitEthernet0/3,,PC-finance,access,20,,,,,,,,
+BRANCH-A-Switch,192.168.99.11,BRANCH-A,access_switch,cisco_ios,GigabitEthernet1/0,,,access,1,,,,,,,,
+BRANCH-A-Switch,192.168.99.11,BRANCH-A,access_switch,cisco_ios,GigabitEthernet1/1,,,access,1,,,,,,,,
+BRANCH-A-Switch,192.168.99.11,BRANCH-A,access_switch,cisco_ios,GigabitEthernet1/2,,,access,1,,,,,,,,
+BRANCH-A-Switch,192.168.99.11,BRANCH-A,access_switch,cisco_ios,GigabitEthernet1/3,,,access,1,,,,,,,,
+BRANCH-A-Switch,192.168.99.11,BRANCH-A,access_switch,cisco_ios,Vlan99,,MANAGEMENT,svi,,,99,192.168.99.11,255.255.255.0,24,192.168.99.11/24,192.168.99.0,192.168.99.0/24
+BRANCH-B-RTR,10.255.3.102,BRANCH-B,router,cisco_ios,GigabitEthernet0/1,,TO-provider1-circuit VLAN102,routed,,,,100.64.1.6,255.255.255.252,30,100.64.1.6/30,100.64.1.4,100.64.1.4/30
+BRANCH-B-RTR,10.255.3.102,BRANCH-B,router,cisco_ios,GigabitEthernet0/2,,TO-provider2-circuit VLAN202,routed,,,,100.65.1.6,255.255.255.252,30,100.65.1.6/30,100.65.1.4,100.65.1.4/30
+BRANCH-B-RTR,10.255.3.102,BRANCH-B,router,cisco_ios,GigabitEthernet0/3,,TO-BRANCH-B-Switch Gi0/1 (TRUNK),subinterface_parent,,,,,,,,,
+BRANCH-B-RTR,10.255.3.102,BRANCH-B,router,cisco_ios,GigabitEthernet0/3.10,GigabitEthernet0/3,VLAN10 MARKETING-B,subinterface,,,10,192.168.110.1,255.255.255.0,24,192.168.110.1/24,192.168.110.0,192.168.110.0/24
+BRANCH-B-RTR,10.255.3.102,BRANCH-B,router,cisco_ios,GigabitEthernet0/3.20,GigabitEthernet0/3,VLAN20 FINANCE-B,subinterface,,,20,192.168.120.1,255.255.255.0,24,192.168.120.1/24,192.168.120.0,192.168.120.0/24
+BRANCH-B-RTR,10.255.3.102,BRANCH-B,router,cisco_ios,GigabitEthernet0/3.99,GigabitEthernet0/3,VLAN99 MANAGEMENT-B (SW-MGMT),subinterface,,,99,192.168.199.1,255.255.255.0,24,192.168.199.1/24,192.168.199.0,192.168.199.0/24
+BRANCH-B-RTR,10.255.3.102,BRANCH-B,router,cisco_ios,Loopback0,,BRANCH-B-LOOPBACK,loopback,,,,10.255.3.102,255.255.255.255,32,10.255.3.102/32,10.255.3.102,10.255.3.102/32
+BRANCH-B-RTR,10.255.3.102,BRANCH-B,router,cisco_ios,Tunnel30,,HQ-DIST1 via VLAN102 (PRIMARY),tunnel,,,,172.16.30.2,255.255.255.252,30,172.16.30.2/30,172.16.30.0,172.16.30.0/30
+BRANCH-B-RTR,10.255.3.102,BRANCH-B,router,cisco_ios,Tunnel40,,HQ-DIST2 via VLAN202 (BACKUP),tunnel,,,,172.16.40.2,255.255.255.252,30,172.16.40.2/30,172.16.40.0,172.16.40.0/30
+BRANCH-B-Switch,192.168.199.11,BRANCH-B,access_switch,cisco_ios,GigabitEthernet0/0,,,access,1,,,,,,,,
+BRANCH-B-Switch,192.168.199.11,BRANCH-B,access_switch,cisco_ios,GigabitEthernet0/1,,UPLINK -> BRANCH-B-RTR Gi0/3,trunk,,1,,,,,,,
+BRANCH-B-Switch,192.168.199.11,BRANCH-B,access_switch,cisco_ios,GigabitEthernet0/2,,PC-marketing,access,10,,,,,,,,
+BRANCH-B-Switch,192.168.199.11,BRANCH-B,access_switch,cisco_ios,GigabitEthernet0/3,,PC-finance,access,20,,,,,,,,
+BRANCH-B-Switch,192.168.199.11,BRANCH-B,access_switch,cisco_ios,GigabitEthernet1/0,,,access,1,,,,,,,,
+BRANCH-B-Switch,192.168.199.11,BRANCH-B,access_switch,cisco_ios,GigabitEthernet1/1,,,access,1,,,,,,,,
+BRANCH-B-Switch,192.168.199.11,BRANCH-B,access_switch,cisco_ios,GigabitEthernet1/2,,,access,1,,,,,,,,
+BRANCH-B-Switch,192.168.199.11,BRANCH-B,access_switch,cisco_ios,GigabitEthernet1/3,,,access,1,,,,,,,,
+BRANCH-B-Switch,192.168.199.11,BRANCH-B,access_switch,cisco_ios,Vlan99,,MANAGEMENT,svi,,,99,192.168.199.11,255.255.255.0,24,192.168.199.11/24,192.168.199.0,192.168.199.0/24
+HQ-CORE-RT01,10.255.1.11,HQ,core_router,cisco_ios,GigabitEthernet0/0,,TO-HQ-CORE-RT02 Gi0/0,routed,,,,10.255.10.9,255.255.255.252,30,10.255.10.9/30,10.255.10.8,10.255.10.8/30
+HQ-CORE-RT01,10.255.1.11,HQ,core_router,cisco_ios,GigabitEthernet0/1,,TO-LAB-MGMT-BR01 Gi0/1,routed,,,,10.255.10.2,255.255.255.252,30,10.255.10.2/30,10.255.10.0,10.255.10.0/30
+HQ-CORE-RT01,10.255.1.11,HQ,core_router,cisco_ios,GigabitEthernet0/2,,TO-HQ-DIST-GW01 Gi0/1,routed,,,,10.255.10.13,255.255.255.252,30,10.255.10.13/30,10.255.10.12,10.255.10.12/30
+HQ-CORE-RT01,10.255.1.11,HQ,core_router,cisco_ios,GigabitEthernet0/3,,TO-ISP-RTR (eBGP),routed,,,,100.66.0.1,255.255.255.252,30,100.66.0.1/30,100.66.0.0,100.66.0.0/30
+HQ-CORE-RT01,10.255.1.11,HQ,core_router,cisco_ios,Loopback0,,CORE1-LOOPBACK,loopback,,,,10.255.1.11,255.255.255.255,32,10.255.1.11/32,10.255.1.11,10.255.1.11/32
+HQ-CORE-RT02,10.255.1.12,HQ,core_router,cisco_ios,GigabitEthernet0/0,,TO-HQ-CORE-RT01 Gi0/0,routed,,,,10.255.10.10,255.255.255.252,30,10.255.10.10/30,10.255.10.8,10.255.10.8/30
+HQ-CORE-RT02,10.255.1.12,HQ,core_router,cisco_ios,GigabitEthernet0/1,,TO-LAB-MGMT-BR01 Gi0/2,routed,,,,10.255.10.6,255.255.255.252,30,10.255.10.6/30,10.255.10.4,10.255.10.4/30
+HQ-CORE-RT02,10.255.1.12,HQ,core_router,cisco_ios,GigabitEthernet0/2,,TO-HQ-DIST-GW02 Gi0/1,routed,,,,10.255.10.17,255.255.255.252,30,10.255.10.17/30,10.255.10.16,10.255.10.16/30
+HQ-CORE-RT02,10.255.1.12,HQ,core_router,cisco_ios,Loopback0,,CORE2-LOOPBACK,loopback,,,,10.255.1.12,255.255.255.255,32,10.255.1.12/32,10.255.1.12,10.255.1.12/32
+HQ-DIST-GW01,10.255.2.21,HQ,dist_switch,cisco_ios,GigabitEthernet0/0,,TO-HQ-DIST-GW02 Gi0/0,routed,,,,10.255.10.21,255.255.255.252,30,10.255.10.21/30,10.255.10.20,10.255.10.20/30
+HQ-DIST-GW01,10.255.2.21,HQ,dist_switch,cisco_ios,GigabitEthernet0/1,,TO-HQ-CORE-RT01 Gi0/2,routed,,,,10.255.10.14,255.255.255.252,30,10.255.10.14/30,10.255.10.12,10.255.10.12/30
+HQ-DIST-GW01,10.255.2.21,HQ,dist_switch,cisco_ios,GigabitEthernet0/2,,TO-provider1-circuit (TRUNK),subinterface_parent,,,,,,,,,
+HQ-DIST-GW01,10.255.2.21,HQ,dist_switch,cisco_ios,GigabitEthernet0/2.101,GigabitEthernet0/2,L2VPN-VLAN101 to BRANCH-A,subinterface,,,101,100.64.1.1,255.255.255.252,30,100.64.1.1/30,100.64.1.0,100.64.1.0/30
+HQ-DIST-GW01,10.255.2.21,HQ,dist_switch,cisco_ios,GigabitEthernet0/2.102,GigabitEthernet0/2,L2VPN-VLAN102 to BRANCH-B,subinterface,,,102,100.64.1.5,255.255.255.252,30,100.64.1.5/30,100.64.1.4,100.64.1.4/30
+HQ-DIST-GW01,10.255.2.21,HQ,dist_switch,cisco_ios,Loopback0,,DIST1-LOOPBACK,loopback,,,,10.255.2.21,255.255.255.255,32,10.255.2.21/32,10.255.2.21,10.255.2.21/32
+HQ-DIST-GW01,10.255.2.21,HQ,dist_switch,cisco_ios,Tunnel10,,BRANCH-A via VLAN101 (PRIMARY),tunnel,,,,172.16.10.1,255.255.255.252,30,172.16.10.1/30,172.16.10.0,172.16.10.0/30
+HQ-DIST-GW01,10.255.2.21,HQ,dist_switch,cisco_ios,Tunnel30,,BRANCH-B via VLAN102 (PRIMARY),tunnel,,,,172.16.30.1,255.255.255.252,30,172.16.30.1/30,172.16.30.0,172.16.30.0/30
+HQ-DIST-GW02,10.255.2.22,HQ,dist_switch,cisco_ios,GigabitEthernet0/0,,TO-HQ-DIST-GW01 Gi0/0,routed,,,,10.255.10.22,255.255.255.252,30,10.255.10.22/30,10.255.10.20,10.255.10.20/30
+HQ-DIST-GW02,10.255.2.22,HQ,dist_switch,cisco_ios,GigabitEthernet0/1,,TO-HQ-CORE-RT02 Gi0/2,routed,,,,10.255.10.18,255.255.255.252,30,10.255.10.18/30,10.255.10.16,10.255.10.16/30
+HQ-DIST-GW02,10.255.2.22,HQ,dist_switch,cisco_ios,GigabitEthernet0/2,,TO-provider2-circuit (TRUNK),subinterface_parent,,,,,,,,,
+HQ-DIST-GW02,10.255.2.22,HQ,dist_switch,cisco_ios,GigabitEthernet0/2.201,GigabitEthernet0/2,L2VPN-VLAN201 to BRANCH-A,subinterface,,,201,100.65.1.1,255.255.255.252,30,100.65.1.1/30,100.65.1.0,100.65.1.0/30
+HQ-DIST-GW02,10.255.2.22,HQ,dist_switch,cisco_ios,GigabitEthernet0/2.202,GigabitEthernet0/2,L2VPN-VLAN202 to BRANCH-B,subinterface,,,202,100.65.1.5,255.255.255.252,30,100.65.1.5/30,100.65.1.4,100.65.1.4/30
+HQ-DIST-GW02,10.255.2.22,HQ,dist_switch,cisco_ios,Loopback0,,DIST2-LOOPBACK,loopback,,,,10.255.2.22,255.255.255.255,32,10.255.2.22/32,10.255.2.22,10.255.2.22/32
+HQ-DIST-GW02,10.255.2.22,HQ,dist_switch,cisco_ios,Tunnel20,,BRANCH-A via VLAN201 (BACKUP),tunnel,,,,172.16.20.1,255.255.255.252,30,172.16.20.1/30,172.16.20.0,172.16.20.0/30
+HQ-DIST-GW02,10.255.2.22,HQ,dist_switch,cisco_ios,Tunnel40,,BRANCH-B via VLAN202 (BACKUP),tunnel,,,,172.16.40.1,255.255.255.252,30,172.16.40.1/30,172.16.40.0,172.16.40.0/30
+LAB-MGMT-BR01,10.255.0.1,MGMT,router,cisco_ios,GigabitEthernet0/0,,TO-PROXMOX-LAN (EVE Cloud Bridge),routed,,,,192.168.1.249,255.255.255.0,24,192.168.1.249/24,192.168.1.0,192.168.1.0/24
+LAB-MGMT-BR01,10.255.0.1,MGMT,router,cisco_ios,GigabitEthernet0/1,,TO-HQ-CORE-RT01 Gi0/1,routed,,,,10.255.10.1,255.255.255.252,30,10.255.10.1/30,10.255.10.0,10.255.10.0/30
+LAB-MGMT-BR01,10.255.0.1,MGMT,router,cisco_ios,GigabitEthernet0/2,,TO-HQ-CORE-RT02 Gi0/1,routed,,,,10.255.10.5,255.255.255.252,30,10.255.10.5/30,10.255.10.4,10.255.10.4/30
+LAB-MGMT-BR01,10.255.0.1,MGMT,router,cisco_ios,Loopback0,,MGMT-LOOPBACK,loopback,,,,10.255.0.1,255.255.255.255,32,10.255.0.1/32,10.255.0.1,10.255.0.1/32

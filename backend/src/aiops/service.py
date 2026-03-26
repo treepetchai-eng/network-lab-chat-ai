@@ -40,6 +40,7 @@ _GROUP_WINDOW = timedelta(minutes=10)
 _RECOVERY_EVENT_STATES = frozenset({"up", "resolved", "recovered", "established", "restored", "cleared", "restart"})
 # Incident statuses that indicate the fault was previously considered over — a new DOWN event here is a re-fault
 _POST_RECOVERY_STATUSES = frozenset({"recovering", "monitoring", "resolved", "resolved_uncertain"})
+_REMEDIATION_HOLD_STATUSES = frozenset({"awaiting_approval", "approved", "executing", "escalated"})
 _GROUP_DECISION_DEBOUNCE = timedelta(seconds=max(1, int(os.getenv("AIOPS_GROUP_DECISION_DEBOUNCE_SECONDS", "5"))))
 _SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
 # Max parallel troubleshoot threads (each uses one LLM slot — keep low to avoid GPU OOM)
@@ -67,7 +68,8 @@ class AIOpsService:
         self._troubleshoot_workers: list[threading.Thread] = []
         self._troubleshoot_running: set[str] = set()   # incident_nos currently being worked
         self._troubleshoot_lock = threading.Lock()
-        self._start_troubleshoot_pool()
+        if not _is_test_runtime():
+            self._start_troubleshoot_pool()
 
     def bootstrap(self) -> None:
         if self._bootstrapped:
@@ -338,6 +340,9 @@ class AIOpsService:
             explanation TEXT NOT NULL DEFAULT '',
             commands_run JSONB NOT NULL DEFAULT '[]'::jsonb,
             llm_model TEXT NOT NULL DEFAULT '',
+            has_workaround BOOLEAN,
+            workaround_text TEXT NOT NULL DEFAULT '',
+            feature_checked TEXT NOT NULL DEFAULT '',
             checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
 
@@ -566,8 +571,7 @@ class AIOpsService:
             self._pipeline_lock.release()
 
     def _auto_resolve_stable_incidents(self) -> int:
-        """Auto-resolve incidents that have been in recovering/monitoring status
-        for the stability window with no new fault events."""
+        """Auto-resolve incidents that have remained stable in monitoring."""
         stability_secs = int(os.getenv("AIOPS_RECOVERY_STABILITY_SECONDS", "300"))  # 5 min default
         with connect() as conn:
             with conn.cursor() as cur:
@@ -575,11 +579,11 @@ class AIOpsService:
                     """
                     UPDATE incidents
                     SET status = 'resolved',
-                        resolution_type = 'auto_recovered',
+                        resolution_type = COALESCE(resolution_type, 'auto_recovered'),
                         resolved_at = NOW(),
                         current_recovery_state = 'recovered',
                         updated_at = NOW()
-                    WHERE status IN ('recovering', 'monitoring')
+                    WHERE status = 'monitoring'
                       AND last_seen_at < NOW() - (interval '1 second' * %s)
                     RETURNING id, incident_no
                     """,
@@ -605,7 +609,7 @@ class AIOpsService:
                         row["id"],
                         "recovery",
                         "Auto-resolved after stability window",
-                        f"No new fault events for {stability_secs // 60} minutes. Incident auto-closed.",
+                        f"Incident remained stable in monitoring for {stability_secs // 60} minutes, so it was auto-closed.",
                         {"stability_seconds": stability_secs},
                     )
             conn.commit()
@@ -1447,6 +1451,8 @@ class AIOpsService:
 
     def _schedule_auto_troubleshoot(self, incident_id: int) -> None:
         """Enqueue incident for troubleshoot if not already queued/running."""
+        if _is_test_runtime():
+            return
         with connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1605,14 +1611,20 @@ class AIOpsService:
                     )
                     return incident_id  # early return, skip normal flow
 
+            refault_after_recovery = bool(
+                incident
+                and decision["event_state"] not in _RECOVERY_EVENT_STATES
+                and incident["status"] in _POST_RECOVERY_STATUSES
+            )
             if decision["event_state"] in _RECOVERY_EVENT_STATES:
                 next_status = "recovering"
             elif incident:
-                # Only mark "reopened" if fault arrives after the incident was recovering/resolved.
-                # If it's still active/new/investigating, keep the current status (more DOWN context).
-                next_status = "reopened" if incident["status"] in _POST_RECOVERY_STATUSES else incident["status"]
+                if incident["status"] in _REMEDIATION_HOLD_STATUSES:
+                    next_status = incident["status"]
+                else:
+                    next_status = "investigating"
             else:
-                next_status = "new"
+                next_status = "investigating"
             recovery_state = "signal_detected" if decision["event_state"] in _RECOVERY_EVENT_STATES else "watching"
             if incident:
                 cur.execute(
@@ -1627,6 +1639,9 @@ class AIOpsService:
                         site = %s,
                         primary_device_id = COALESCE(%s, primary_device_id),
                         primary_source_ip = %s,
+                        resolution_type = CASE WHEN %s THEN NULL ELSE resolution_type END,
+                        resolved_at = CASE WHEN %s THEN NULL ELSE resolved_at END,
+                        reopened_count = CASE WHEN %s THEN reopened_count + 1 ELSE reopened_count END,
                         last_seen_at = NOW(),
                         updated_at = NOW()
                     WHERE id = %s
@@ -1642,6 +1657,9 @@ class AIOpsService:
                         device["site"] if device else "",
                         device["id"] if device else None,
                         device["ip_address"] if device else group["source_ip"],
+                        refault_after_recovery,
+                        refault_after_recovery,
+                        refault_after_recovery,
                         incident["id"],
                     ),
                 )
@@ -1908,7 +1926,7 @@ class AIOpsService:
         approvals = self.approvals(limit=20)
         with connect() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) AS count FROM incidents WHERE status = 'recovering'")
+                cur.execute("SELECT COUNT(*) AS count FROM incidents WHERE status IN ('recovering', 'monitoring')")
                 recovering = cur.fetchone()["count"]
                 cur.execute("SELECT COUNT(*) AS count FROM incidents WHERE status = 'resolved' AND resolved_at >= NOW() - INTERVAL '1 day'")
                 resolved_today = cur.fetchone()["count"]
@@ -2462,6 +2480,9 @@ class AIOpsService:
         explanation: str,
         commands_run: list[dict[str, str]],
         llm_model: str = "",
+        has_workaround: bool | None = None,
+        workaround_text: str = "",
+        feature_checked: str = "",
     ) -> dict[str, Any]:
         """Persist an advisory impact check result and return the saved row."""
         with connect() as conn:
@@ -2477,14 +2498,16 @@ class AIOpsService:
                     """
                     INSERT INTO advisory_checks
                         (device_id, advisory_id, advisory_title, verdict, confidence,
-                         explanation, commands_run, llm_model)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                         explanation, commands_run, llm_model,
+                         has_workaround, workaround_text, feature_checked)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)
                     RETURNING *
                     """,
                     (
                         device["id"], advisory_id, advisory_title, verdict,
                         confidence, explanation,
                         Json(commands_run), llm_model,
+                        has_workaround, workaround_text, feature_checked,
                     ),
                 )
                 row = dict(cur.fetchone())
@@ -2739,10 +2762,10 @@ class AIOpsService:
                     "monitor_further": ("investigating", None),
                     "physical_issue": ("escalated", "physical_handoff"),
                     "external_issue": ("escalated", "external_handoff"),
-                    "config_fix_possible": ("awaiting_approval" if proposal else "active", None),
-                    "needs_human_review": ("active", None),
+                    "config_fix_possible": ("awaiting_approval" if proposal else "investigating", None),
+                    "needs_human_review": ("investigating", None),
                 }
-                next_status, resolution_type = status_map.get(disposition, ("active", None))
+                next_status, resolution_type = status_map.get(disposition, ("investigating", None))
                 # Re-fetch current status — a recovery signal may have arrived while
                 # troubleshoot was running and already advanced the incident to
                 # "recovering" or "monitoring".  Never downgrade those states.
@@ -2948,11 +2971,7 @@ class AIOpsService:
     def verify_recovery(self, incident_no: str, healed: bool, note: str) -> dict[str, Any]:
         detail = self.get_incident(incident_no)
         incident = detail["incident"]
-        # healed=False from verifying state → re-open as active for re-investigation
-        if not healed and incident.get("status") == "verifying":
-            next_status = "active"
-        else:
-            next_status = "resolved" if healed else "monitoring"
+        next_status = "monitoring" if healed else "investigating"
         resolution_type = "verified_recovery" if healed else None
         with connect() as conn:
             with conn.cursor() as cur:
@@ -2960,13 +2979,13 @@ class AIOpsService:
                     """
                     UPDATE incidents
                     SET status = %s,
-                        resolution_type = COALESCE(%s, resolution_type),
-                        resolved_at = CASE WHEN %s THEN NOW() ELSE resolved_at END,
+                        resolution_type = CASE WHEN %s THEN COALESCE(%s, resolution_type) ELSE NULL END,
+                        resolved_at = NULL,
                         current_recovery_state = %s,
                         updated_at = NOW()
                     WHERE id = %s
                     """,
-                    (next_status, resolution_type, healed, "recovered" if healed else "monitoring", incident["id"]),
+                    (next_status, healed, resolution_type, "monitoring" if healed else "watching", incident["id"]),
                 )
                 self._record_timeline(
                     cur,

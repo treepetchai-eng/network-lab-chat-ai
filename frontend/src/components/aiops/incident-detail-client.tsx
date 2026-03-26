@@ -684,17 +684,28 @@ export function IncidentDetailClient({ initialData }: { initialData: AIOpsIncide
   const [error, setError]           = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [activeTab, setActiveTab]   = useState<Tab>("overview");
+  const [chatVisited, setChatVisited] = useState(false);
 
   const incident = data.incident;
 
   const refresh = useCallback(async () => {
-    try { setData(await fetchIncidentDetail(incident.incident_no)); } catch (_) { /* ignore — background poll, error already visible via action errors */ }
+    try { setData(await fetchIncidentDetail(incident.incident_no)); } catch { /* ignore — background poll, error already visible via action errors */ }
   }, [incident.incident_no]);
 
   useEffect(() => {
     const id = setInterval(refresh, POLL_INTERVAL);
     return () => clearInterval(id);
   }, [refresh]);
+
+  useEffect(() => {
+    if (activeTab === "chat") {
+      setChatVisited(true);
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
+    setChatVisited(activeTab === "chat");
+  }, [incident.incident_no, activeTab]);
 
   const withAction = useCallback((name: string, fn: () => Promise<AIOpsIncidentDetailPayload>) => {
     setError(null);
@@ -761,10 +772,10 @@ export function IncidentDetailClient({ initialData }: { initialData: AIOpsIncide
                 onClick={() => withAction("verify", () => submitRecoveryDecision(incident.incident_no, { healed: true, note: "Recovery confirmed by operator." }))}
                 className="inline-flex items-center gap-2 rounded border border-emerald-500/40 bg-emerald-500/15 px-4 py-2 text-[0.82rem] font-semibold text-emerald-300 transition hover:bg-emerald-500/25 disabled:opacity-40">
                 {actionLoading === "verify" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
-                {actionLoading === "verify" ? "Confirming…" : "Mark Recovered — Close Incident"}
+                {actionLoading === "verify" ? "Confirming…" : "Mark Recovered — Start Monitoring"}
               </button>
               <button disabled={pending}
-                onClick={() => withAction("not-healed", () => submitRecoveryDecision(incident.incident_no, { healed: false, note: "Still broken after execution — returned to monitoring." }))}
+                onClick={() => withAction("not-healed", () => submitRecoveryDecision(incident.incident_no, { healed: false, note: "Still broken after execution — returned to investigation." }))}
                 className="inline-flex items-center gap-2 rounded border border-rose-500/30 bg-rose-500/[0.07] px-4 py-2 text-[0.82rem] font-semibold text-rose-400 transition hover:bg-rose-500/15 disabled:opacity-40">
                 {actionLoading === "not-healed" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <XCircle className="h-3.5 w-3.5" />}
                 Mark Still Broken
@@ -790,7 +801,7 @@ export function IncidentDetailClient({ initialData }: { initialData: AIOpsIncide
               onClick={() => withAction("verify", () => submitRecoveryDecision(incident.incident_no, { healed: true, note: "Recovery confirmed by operator." }))}
               className="inline-flex items-center gap-1.5 rounded border border-emerald-500/25 bg-emerald-500/[0.08] px-3 py-1.5 text-[0.78rem] font-medium text-emerald-300 transition hover:bg-emerald-500/15 disabled:opacity-50">
               {actionLoading === "verify" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
-              Mark Recovered
+              Mark Recovered — Start Monitoring
             </button>
             {error && <p className="text-[0.78rem] text-rose-400">{error}</p>}
           </div>
@@ -842,9 +853,9 @@ export function IncidentDetailClient({ initialData }: { initialData: AIOpsIncide
       )}
 
       {/* ── Chat tab ── */}
-      {activeTab === "chat" && (
-        <div>
-          <IncidentChat data={data} />
+      {chatVisited && (
+        <div className={activeTab === "chat" ? "block" : "hidden"} aria-hidden={activeTab !== "chat"}>
+          <IncidentChat key={data.incident.incident_no} data={data} />
         </div>
       )}
     </div>

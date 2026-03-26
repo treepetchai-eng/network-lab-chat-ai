@@ -26,10 +26,12 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from src.aiops.service import AIOpsService
+from src.formatters import extract_executed_command, is_error, strip_tool_metadata
 from src.session_manager import cleanup_stale, create_session, delete_session, get_session, session_count
 from src.sse_stream import stream_chat
 from src.tools.inventory_tools import list_all_devices
@@ -44,6 +46,71 @@ _aiops_service = AIOpsService()
 _AIOPS_WORKER_INTERVAL_SECONDS = max(1, int(os.getenv("AIOPS_WORKER_INTERVAL_SECONDS", "2")))
 _AIOPS_MAX_PARSE_PER_CYCLE = max(1, int(os.getenv("AIOPS_MAX_PARSE_PER_CYCLE", "4")))
 _AIOPS_MAX_DECISIONS_PER_CYCLE = max(1, int(os.getenv("AIOPS_MAX_DECISIONS_PER_CYCLE", "3")))
+_EXECUTION_TOOL_NAMES = frozenset({"run_cli", "run_diagnostic"})
+
+
+def _existing_evidence_guidance() -> str:
+    return (
+        "Recorded troubleshoot evidence may already answer follow-up questions. "
+        "Reuse it first for summary, interpretation, root-cause, and next-step "
+        "questions. Do not rerun the same command unless the user explicitly "
+        "asks for a fresh live re-check or the existing evidence is clearly "
+        "insufficient."
+    )
+
+
+def _preloaded_tool_status(content: str) -> str:
+    cleaned = strip_tool_metadata(content or "").strip()
+    if not cleaned:
+        return "success"
+    return "error" if is_error(cleaned) else "success"
+
+
+def _build_incident_preloaded_messages(detail: dict) -> list[BaseMessage]:
+    ts = detail.get("troubleshoot") or {}
+    steps = ts.get("steps") or []
+    summary = str(ts.get("summary") or "").strip()
+    conclusion = str(ts.get("conclusion") or "").strip()
+
+    if not summary and not conclusion and not steps:
+        return []
+
+    lines = [
+        "[System: Existing incident troubleshoot evidence]",
+        _existing_evidence_guidance(),
+    ]
+    if summary:
+        lines.append(f"Recorded troubleshoot summary: {summary}")
+    if conclusion:
+        lines.append(f"Recorded engineering judgment: {conclusion}")
+
+    messages: list[BaseMessage] = [HumanMessage(content="\n".join(lines))]
+
+    for index, step in enumerate(steps[:8], 1):
+        tool_name = str(step.get("tool_name") or "").strip()
+        if tool_name not in _EXECUTION_TOOL_NAMES:
+            continue
+        args = dict(step.get("args") or {})
+        content = str(step.get("content") or "")
+        executed_command = extract_executed_command(content) or str(args.get("command", "") or "").strip()
+        metadata = {
+            "tool_args": args,
+            "tool_status": _preloaded_tool_status(content),
+            "preloaded_evidence": True,
+            "source": "incident_troubleshoot",
+        }
+        if executed_command:
+            metadata["executed_command"] = executed_command
+        messages.append(
+            ToolMessage(
+                content=content,
+                tool_call_id=f"preloaded-{index}",
+                name=tool_name,
+                additional_kwargs=metadata,
+            )
+        )
+
+    return messages
 
 
 def _is_test_runtime() -> bool:
@@ -202,16 +269,30 @@ def _build_incident_context(detail: dict) -> str:
             lines.append(f"\nAI Summary:\n{summary_text}")
 
     if ts:
+        summary_text = str(ts.get("summary") or "").strip()
+        conclusion_text = str(ts.get("conclusion") or "").strip()
         steps = ts.get("steps") or []
-        cli_steps = [s for s in steps if s.get("tool_name") == "run_cli"]
-        if cli_steps:
-            lines.append("\nCLI Evidence Already Gathered:")
-            for i, step in enumerate(cli_steps[:4], 1):
-                cmd = (step.get("args") or {}).get("command", "?")
-                output = (step.get("content") or "").strip()[:600]
-                lines.append(f"  [{i}] {cmd}")
+        if summary_text or conclusion_text or steps:
+            lines.append("\nRecorded Troubleshoot Result:")
+            if summary_text:
+                lines.append(f"  Summary: {summary_text[:500]}")
+            if conclusion_text:
+                lines.append(f"  Conclusion: {conclusion_text[:500]}")
+            lines.append(f"  Guidance: {_existing_evidence_guidance()}")
+
+        evidence_steps = [s for s in steps if str(s.get("tool_name") or "").strip() in _EXECUTION_TOOL_NAMES]
+        if evidence_steps:
+            lines.append("\nRecorded CLI / diagnostic evidence:")
+            for i, step in enumerate(evidence_steps[:6], 1):
+                args = step.get("args") or {}
+                raw_output = str(step.get("content") or "").strip()
+                status = _preloaded_tool_status(raw_output)
+                cmd = extract_executed_command(raw_output) or str(args.get("command", "") or args.get("kind", "?")).strip() or "?"
+                host = str(args.get("host", "") or inc.get("primary_hostname") or inc.get("primary_source_ip") or "").strip()
+                output = strip_tool_metadata(raw_output)[:320]
+                lines.append(f"  [{i}] status={status} host={host or '?'} command={cmd}")
                 if output:
-                    lines.append(f"      {output[:300]}")
+                    lines.append(f"      {output}")
 
     if logs:
         lines.append("\nRecent Syslog (latest first):")
@@ -235,6 +316,7 @@ async def create_incident_session_endpoint(incident_no: str):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     incident_context = _build_incident_context(detail)
+    preloaded_messages = _build_incident_preloaded_messages(detail)
 
     # Pre-populate device_cache with the primary device so the LLM can SSH
     # immediately without calling lookup_device first.
@@ -255,6 +337,7 @@ async def create_incident_session_endpoint(incident_no: str):
     session = await create_session(
         incident_context=incident_context,
         device_cache_prefill=device_cache_prefill,
+        preloaded_messages=preloaded_messages,
     )
     return CreateSessionResponse(session_id=session.session_id)
 
@@ -489,6 +572,9 @@ async def aiops_clear_checks_endpoint(hostname: str):
     """Clear all advisory impact check results for a device (for testing)."""
     _ensure_aiops_ready()
     deleted = _aiops_service.clear_advisory_checks(hostname)
+    # Also clear LLM plan cache so re-checks get fresh plans
+    from src.aiops.advisory_checker import clear_plan_cache
+    clear_plan_cache()
     return {"deleted": deleted}
 
 
@@ -522,7 +608,10 @@ async def aiops_advisory_check_sse_endpoint(hostname: str, advisory_id: str):
     _SENTINEL = object()
 
     def _run_check():
-        from src.aiops.advisory_checker import check_advisory_impact
+        from src.aiops.advisory_checker import check_advisory_impact, clear_plan_cache
+        # Always clear cached plan for this advisory so each check runs fresh
+        clear_plan_cache(advisory_id)
+
         def _push(evt: dict):
             evt_queue.put(evt)
 
@@ -539,6 +628,9 @@ async def aiops_advisory_check_sse_endpoint(hostname: str, advisory_id: str):
                 explanation=result["explanation"],
                 commands_run=result["commands_run"],
                 llm_model=os.getenv("LLM_MODEL", ""),
+                has_workaround=result.get("has_workaround"),
+                workaround_text=result.get("workaround_text", ""),
+                feature_checked=result.get("feature_checked", ""),
             )
         except Exception as exc:
             logger.warning("Failed to persist advisory check: %s", exc)

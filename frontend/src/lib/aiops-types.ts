@@ -258,5 +258,8 @@ export interface AIOpsAdvisoryCheck {
   explanation: string;
   commands_run: Array<{ command: string; output: string }>;
   llm_model: string;
+  has_workaround: boolean | null;
+  workaround_text: string;
+  feature_checked: string;
   checked_at: string;
 }

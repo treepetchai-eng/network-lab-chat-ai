@@ -17,6 +17,13 @@ import re
 _HEADER_RE = re.compile(
     r"^\[Device:\s*(?P<host>.+?)\s*\|\s*IP:\s*(?P<ip>.+?)\s*\|\s*OS:\s*(?P<os>.+?)\]"
 )
+_EXECUTED_COMMAND_RE = re.compile(r"^\[EXECUTED COMMAND\]\s*(?P<command>.+?)\s*$", re.MULTILINE)
+_CLI_COMMAND_ERROR_PATTERNS = (
+    re.compile(r"^\s*%\s*Invalid input", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\s*%\s*Incomplete command", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\s*%\s*Ambiguous command", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\s*%\s*Unknown command", re.IGNORECASE | re.MULTILINE),
+)
 
 _ERROR_PREFIXES = (
     "[AUTH ERROR]",
@@ -60,29 +67,54 @@ def parse_output(raw: str) -> tuple[str, str, str, str]:
     return "", "", "", raw.strip()
 
 
+def extract_executed_command(raw: str) -> str:
+    """Extract an explicit executed-command wrapper from tool output."""
+    match = _EXECUTED_COMMAND_RE.search(raw or "")
+    return match.group("command").strip() if match else ""
+
+
 def os_label(os_type: str) -> str:
     """Map an internal OS identifier to a human-readable label."""
     return _OS_LABEL.get(os_type, os_type)
 
 
+def strip_tool_metadata(body: str) -> str:
+    """Remove non-CLI metadata wrappers before rendering to the UI."""
+    lines = []
+    for line in (body or "").splitlines():
+        if line.startswith("[DIAGNOSTIC]") or line.startswith("[EXECUTED COMMAND]") or line.startswith("[RESOLVED TARGET]"):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def is_command_error(body: str) -> bool:
+    """Return True when CLI output shows a device-side command syntax error."""
+    cleaned = strip_tool_metadata(body)
+    return any(pattern.search(cleaned) for pattern in _CLI_COMMAND_ERROR_PATTERNS)
+
+
 def is_error(body: str) -> bool:
     """Return *True* if *body* starts with a known error prefix."""
-    return any(body.startswith(p) for p in _ERROR_PREFIXES)
+    cleaned = strip_tool_metadata(body)
+    return any(cleaned.startswith(p) for p in _ERROR_PREFIXES) or is_command_error(cleaned)
 
 
 def fmt_cli_output(
     hostname: str, ip: str, os_type: str, command: str, body: str,
 ) -> str:
     """Format successful SSH CLI output as Markdown."""
+    cleaned_body = strip_tool_metadata(body)
     return (
         f"**{hostname}** `{ip}` ({os_label(os_type)})\n\n"
-        f"```\n{hostname}# {command}\n{body}\n```"
+        f"```\n{hostname}# {command}\n{cleaned_body}\n```"
     )
 
 
 def fmt_cli_error(ip: str, body: str) -> str:
     """Format an SSH error as Markdown."""
-    return f"**Error** connecting to `{ip}`\n\n```\n{body}\n```"
+    cleaned_body = strip_tool_metadata(body)
+    return f"**Error** connecting to `{ip}`\n\n```\n{cleaned_body}\n```"
 
 
 def fmt_lookup(raw: str) -> str:
@@ -94,6 +126,17 @@ def fmt_lookup(raw: str) -> str:
 
     if "error" in data:
         sugg = data.get("suggestions", [])
+        candidates = data.get("candidates", [])
+        if candidates:
+            lines = ["Lookup ambiguous"]
+            for candidate in candidates[:4]:
+                interface = candidate.get("interface") or {}
+                interface_name = interface.get("name", "?")
+                ip_address = interface.get("ip_address", "?")
+                lines.append(
+                    f"- {candidate.get('hostname', '?')} via {interface_name} ({ip_address})"
+                )
+            return "\n".join(lines)
         sugg_str = ", ".join(sugg[:6]) + ("..." if len(sugg) > 6 else "")
         return f"Not found. Suggestions: {sugg_str}"
 
@@ -103,16 +146,44 @@ def fmt_lookup(raw: str) -> str:
     role = data.get("device_role", "?")
     site = data.get("site", "?")
     version = data.get("version", "?")
+    resolved_via = data.get("resolved_via", "")
+    matched_value = data.get("matched_value", "")
+    matched_interface = data.get("matched_interface") or {}
 
-    return (
-        "Device Resolved\n\n"
-        f"{hostname}\n"
-        f"IP: {ip}\n"
-        f"OS: {os_label(os_type)}\n"
-        f"Role: {role}\n"
-        f"Site: {site}\n"
-        f"Version: {version}"
-    )
+    lines = [
+        "Device Resolved",
+        "",
+        hostname,
+        f"IP: {ip}",
+        f"OS: {os_label(os_type)}",
+        f"Role: {role}",
+        f"Site: {site}",
+        f"Version: {version}",
+    ]
+    if resolved_via == "interface_ip" and matched_value:
+        lines.append(f"Resolved via: interface IP {matched_value}")
+    elif resolved_via == "tunnel_ip" and matched_value:
+        lines.append(f"Resolved via: tunnel IP {matched_value}")
+    elif resolved_via == "management_ip" and matched_value:
+        lines.append(f"Resolved via: management IP {matched_value}")
+
+    if resolved_via == "interface_ip" and matched_interface:
+        interface_name = matched_interface.get("name", "?")
+        interface_ip = matched_interface.get("ip_address", "")
+        network_cidr = matched_interface.get("network_cidr", "")
+        interface_mode = matched_interface.get("interface_mode", "")
+        description = matched_interface.get("description", "")
+        lines.append(f"Matched Interface: {interface_name}")
+        if interface_ip:
+            lines.append(f"Interface IP: {interface_ip}")
+        if network_cidr:
+            lines.append(f"Interface Network: {network_cidr}")
+        if interface_mode:
+            lines.append(f"Interface Mode: {interface_mode}")
+        if description:
+            lines.append(f"Interface Description: {description}")
+
+    return "\n".join(lines)
 
 
 def fmt_device_list(raw: str) -> str:

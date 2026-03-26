@@ -39,6 +39,7 @@ def test_aiops_ingest_creates_incident_and_exposes_detail():
         assert incident_response.status_code == 200
         incident_payload = incident_response.json()
         assert incident_payload["incident"]["event_family"] == "bgp"
+        assert incident_payload["incident"]["status"] == "investigating"
         assert incident_payload["raw_logs"]
 
         logs_response = client.get("/api/aiops/logs", params={"incident_no": incident_no})

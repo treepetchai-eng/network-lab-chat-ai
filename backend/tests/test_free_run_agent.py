@@ -39,6 +39,49 @@ def test_sanitize_messages_adds_run_cli_failure_context():
     assert "[TIMEOUT ERROR]" in rendered
 
 
+def test_sanitize_messages_includes_run_diagnostic_command_context():
+    from src.graph.agents.free_run_agent import _sanitize_messages
+
+    messages = [
+        ToolMessage(
+            content=(
+                "[DIAGNOSTIC] kind=traceroute requested_target=BRANCH-A-Switch\n"
+                "[EXECUTED COMMAND] traceroute 192.168.99.11\n"
+                "[Device: HQ-CORE-RT01 | IP: 10.255.1.11 | OS: cisco_ios]\n"
+                "  1 172.16.10.2 1 msec 2 msec 2 msec\n"
+                "  2 192.168.99.11 3 msec 3 msec 3 msec\n"
+                "[TRACE TARGET CONTEXT]\n"
+                "- exact owner(s): BRANCH-A-Switch Vlan99 [svi, role=access_switch, network=192.168.99.0/24, desc=MANAGEMENT]\n"
+                "- same-network candidate(s): BRANCH-A-RTR GigabitEthernet0/3.99 [subinterface, role=router, network=192.168.99.0/24, desc=VLAN99 MANAGEMENT-A (SW-MGMT)]\n"
+                "[TRACE HOP ANNOTATION]\n"
+                "- hop 1: 172.16.10.2 -> exact=BRANCH-A-RTR Tunnel10 [tunnel, role=router, network=172.16.10.0/30, desc=HQ-DIST1 via VLAN101 (PRIMARY)]\n"
+            ),
+            tool_call_id="call-1",
+            name="run_diagnostic",
+            additional_kwargs={
+                "tool_args": {
+                    "host": "HQ-CORE-RT01",
+                    "kind": "traceroute",
+                    "target": "BRANCH-A-Switch",
+                },
+                "tool_status": "success",
+                "executed_command": "traceroute 192.168.99.11",
+            },
+        )
+    ]
+
+    clean = _sanitize_messages(messages)
+
+    assert len(clean) == 1
+    rendered = clean[0].content
+    assert "status=success" in rendered
+    assert "command=traceroute 192.168.99.11" in rendered
+    assert "kind=traceroute" in rendered
+    assert "host=HQ-CORE-RT01" in rendered
+    assert "BRANCH-A-RTR Tunnel10" in rendered
+    assert "BRANCH-A-Switch Vlan99" in rendered
+
+
 def test_free_run_node_attaches_run_cli_metadata_for_failures():
     from src.graph.agents.free_run_agent import free_run_node
 
@@ -184,6 +227,49 @@ def test_ssh_compact_prompt_preserves_topology_scope_guidance():
     assert "Do not restart the whole topology/protocol sweep" in SSH_COMPACT_PROMPT
     assert "prefer `show ip protocols` and protocol neighbor" in SSH_COMPACT_PROMPT
     assert "`show ip protocols` proves protocol presence/configuration" in SSH_COMPACT_PROMPT
+
+
+def test_free_run_node_injects_routing_context_and_prefills_candidates():
+    from src.graph.agents.free_run_agent import free_run_node
+
+    class DummyLLM:
+        def __init__(self):
+            self.calls = []
+
+        def bind_tools(self, _tools):
+            return self
+
+        def invoke(self, messages):
+            self.calls.append(messages)
+            system_text = str(messages[0].content)
+            assert "ACTIVE ROUTING CONTEXT" in system_text
+            assert "HQ-CORE-RT01" in system_text
+            assert "BRANCH-A-RTR" in system_text
+            assert "show ip route 192.168.99.11" in system_text
+            return AIMessage(content="เริ่มเช็ค route จาก HQ-CORE-RT01 ก่อน", tool_calls=[])
+
+    class DummyAnswerLLM:
+        def invoke(self, _messages):
+            return AIMessage(content="unused")
+
+    class DummyRunCliTool:
+        def invoke(self, _args):
+            return "unused"
+
+    result = free_run_node(
+        {
+            "messages": [HumanMessage(content="route ไป 192.168.99.11 จาก HQ-CORE-RT01 ผ่านไหน")],
+            "device_cache": {},
+        },
+        llm=DummyLLM(),
+        answer_llm=DummyAnswerLLM(),
+        run_cli_tool=DummyRunCliTool(),
+    )
+
+    assert "HQ-CORE-RT01" in result["device_cache"]
+    assert "BRANCH-A-RTR" in result["device_cache"]
+    assert isinstance(result["messages"][-1], AIMessage)
+    assert "HQ-CORE-RT01" in result["messages"][-1].content
 
 
 def test_synthesize_final_answer_uses_evidence_not_raw_dump():
@@ -352,6 +438,68 @@ def test_build_evidence_digest_includes_logical_relationships():
     assert "[Logical Relationship Digest]" in digest
     assert "protocol=bgp, HQ-CORE-RT01 <-> 100.66.0.2" in digest
     assert "protocol=eigrp, BRANCH-B-RTR <-> 10.255.3.1" in digest
+
+
+def test_build_evidence_digest_includes_traceroute_symmetry_digest():
+    from src.graph.agents.free_run_agent import _build_evidence_digest
+
+    digest = _build_evidence_digest(
+        [
+            ToolMessage(
+                content=(
+                    "[DIAGNOSTIC] kind=traceroute requested_target=BRANCH-A-Switch\n"
+                    "[EXECUTED COMMAND] traceroute 192.168.99.11\n"
+                    "[RESOLVED TARGET] BRANCH-A-Switch (192.168.99.11)\n"
+                    "[Device: HQ-CORE-RT01 | IP: 10.255.1.11 | OS: cisco_ios]\n"
+                    "  1 10.255.10.14 1 msec\n"
+                    "  2 172.16.10.2 2 msec\n"
+                    "  3 192.168.99.11 3 msec\n"
+                    "[TRACE HOP ANNOTATION]\n"
+                    "- hop 1: 10.255.10.14 -> exact=HQ-DIST-GW01 GigabitEthernet0/1 [routed]; same_network=HQ-CORE-RT01 GigabitEthernet0/2 [routed]\n"
+                    "- hop 2: 172.16.10.2 -> exact=BRANCH-A-RTR Tunnel10 [tunnel]; same_network=HQ-DIST-GW01 Tunnel10 [tunnel]\n"
+                    "- hop 3: 192.168.99.11 -> exact=BRANCH-A-Switch Vlan99 [svi]; same_network=BRANCH-A-RTR GigabitEthernet0/3.99 [subinterface]\n"
+                ),
+                tool_call_id="call-1",
+                name="run_diagnostic",
+                additional_kwargs={
+                    "tool_args": {"host": "HQ-CORE-RT01", "kind": "traceroute", "target": "BRANCH-A-Switch"},
+                    "tool_status": "success",
+                    "executed_command": "traceroute 192.168.99.11",
+                },
+            ),
+            ToolMessage(
+                content=(
+                    "[DIAGNOSTIC] kind=traceroute requested_target=10.255.1.11\n"
+                    "[EXECUTED COMMAND] traceroute 10.255.1.11\n"
+                    "[Device: BRANCH-A-Switch | IP: 192.168.99.11 | OS: cisco_ios]\n"
+                    "  1 192.168.99.1 1 msec\n"
+                    "  2 172.16.10.1 2 msec\n"
+                    "  3 10.255.10.13 3 msec\n"
+                    "[TRACE TARGET CONTEXT]\n"
+                    "- exact owner(s): HQ-CORE-RT01 Loopback0 [loopback]\n"
+                    "[TRACE HOP ANNOTATION]\n"
+                    "- hop 1: 192.168.99.1 -> exact=BRANCH-A-RTR GigabitEthernet0/3.99 [subinterface]; same_network=BRANCH-A-Switch Vlan99 [svi]\n"
+                    "- hop 2: 172.16.10.1 -> exact=HQ-DIST-GW01 Tunnel10 [tunnel]; same_network=BRANCH-A-RTR Tunnel10 [tunnel]\n"
+                    "- hop 3: 10.255.10.13 -> exact=HQ-CORE-RT01 GigabitEthernet0/2 [routed]; same_network=HQ-DIST-GW01 GigabitEthernet0/1 [routed]\n"
+                ),
+                tool_call_id="call-2",
+                name="run_diagnostic",
+                additional_kwargs={
+                    "tool_args": {"host": "BRANCH-A-Switch", "kind": "traceroute", "target": "10.255.1.11"},
+                    "tool_status": "success",
+                    "executed_command": "traceroute 10.255.1.11",
+                },
+            ),
+        ]
+    )
+
+    assert "[Traceroute Symmetry Digest]" in digest
+    assert "forward_path_hosts=HQ-CORE-RT01 -> HQ-DIST-GW01 -> BRANCH-A-RTR -> BRANCH-A-Switch" in digest
+    assert "reverse_path_hosts=BRANCH-A-Switch -> BRANCH-A-RTR -> HQ-DIST-GW01 -> HQ-CORE-RT01" in digest
+    assert "forward_hops=1:10.255.10.14/HQ-DIST-GW01 ; 2:172.16.10.2/BRANCH-A-RTR ; 3:192.168.99.11/BRANCH-A-Switch" in digest
+    assert "reverse_hops=1:192.168.99.1/BRANCH-A-RTR ; 2:172.16.10.1/HQ-DIST-GW01 ; 3:10.255.10.13/HQ-CORE-RT01" in digest
+    assert "verdict=likely_symmetric" in digest
+    assert "mirrored_hops=" in digest
 
 
 def test_free_run_node_reminds_llm_when_logical_topology_requested_without_logical_evidence():
@@ -803,6 +951,188 @@ def test_synthesize_final_answer_polishes_relationship_answers_with_ascii_or_tab
     )
 
 
+def test_synthesize_final_answer_repairs_traceroute_symmetry_verdict():
+    from src.graph.agents.free_run_agent import _synthesize_final_answer
+    from langchain_core.messages import SystemMessage
+
+    class DummyAnswerLLM:
+        def __init__(self):
+            self.call_count = 0
+
+        def invoke(self, _messages):
+            self.call_count += 1
+            if self.call_count == 1:
+                return AIMessage(content="เส้นทางไม่สมมาตร เพราะ hop แต่ละฝั่งเป็นคนละ IP")
+            return AIMessage(
+                content=(
+                    "เส้นทางน่าจะสมมาตร\n"
+                    "ไป: 10.255.10.14 -> 172.16.10.2 -> 192.168.99.11\n"
+                    "กลับ: 192.168.99.1 -> 172.16.10.1 -> 10.255.10.13\n"
+                    "เมื่ออ่านเส้นทางกลับย้อนลำดับ จะเป็นลิงก์ชุดเดียวกัน"
+                )
+            )
+
+    result = _synthesize_final_answer(
+        answer_llm=DummyAnswerLLM(),
+        system_msg=SystemMessage(content="system"),
+        device_cache={},
+        original_context=[HumanMessage(content="traceroute ไป-กลับแล้ววิเคราะห์หน่อยว่าทางเดียวกันหรือไม่")],
+        session_messages=[HumanMessage(content="traceroute ไป-กลับแล้ววิเคราะห์หน่อยว่าทางเดียวกันหรือไม่")],
+        result_messages=[
+            ToolMessage(
+                content=(
+                    "[DIAGNOSTIC] kind=traceroute requested_target=BRANCH-A-Switch\n"
+                    "[EXECUTED COMMAND] traceroute 192.168.99.11\n"
+                    "[RESOLVED TARGET] BRANCH-A-Switch (192.168.99.11)\n"
+                    "[Device: HQ-CORE-RT01 | IP: 10.255.1.11 | OS: cisco_ios]\n"
+                    "  1 10.255.10.14 1 msec\n"
+                    "  2 172.16.10.2 2 msec\n"
+                    "  3 192.168.99.11 3 msec\n"
+                    "[TRACE HOP ANNOTATION]\n"
+                    "- hop 1: 10.255.10.14 -> exact=HQ-DIST-GW01 GigabitEthernet0/1 [routed]\n"
+                    "- hop 2: 172.16.10.2 -> exact=BRANCH-A-RTR Tunnel10 [tunnel]\n"
+                    "- hop 3: 192.168.99.11 -> exact=BRANCH-A-Switch Vlan99 [svi]\n"
+                ),
+                tool_call_id="call-1",
+                name="run_diagnostic",
+                additional_kwargs={
+                    "tool_args": {"host": "HQ-CORE-RT01", "kind": "traceroute", "target": "BRANCH-A-Switch"},
+                    "tool_status": "success",
+                    "executed_command": "traceroute 192.168.99.11",
+                },
+            ),
+            ToolMessage(
+                content=(
+                    "[DIAGNOSTIC] kind=traceroute requested_target=10.255.1.11\n"
+                    "[EXECUTED COMMAND] traceroute 10.255.1.11\n"
+                    "[Device: BRANCH-A-Switch | IP: 192.168.99.11 | OS: cisco_ios]\n"
+                    "  1 192.168.99.1 1 msec\n"
+                    "  2 172.16.10.1 2 msec\n"
+                    "  3 10.255.10.13 3 msec\n"
+                    "[TRACE TARGET CONTEXT]\n"
+                    "- exact owner(s): HQ-CORE-RT01 Loopback0 [loopback]\n"
+                    "[TRACE HOP ANNOTATION]\n"
+                    "- hop 1: 192.168.99.1 -> exact=BRANCH-A-RTR GigabitEthernet0/3.99 [subinterface]\n"
+                    "- hop 2: 172.16.10.1 -> exact=HQ-DIST-GW01 Tunnel10 [tunnel]\n"
+                    "- hop 3: 10.255.10.13 -> exact=HQ-CORE-RT01 GigabitEthernet0/2 [routed]\n"
+                ),
+                tool_call_id="call-2",
+                name="run_diagnostic",
+                additional_kwargs={
+                    "tool_args": {"host": "BRANCH-A-Switch", "kind": "traceroute", "target": "10.255.1.11"},
+                    "tool_status": "success",
+                    "executed_command": "traceroute 10.255.1.11",
+                },
+            ),
+        ],
+        user_query="traceroute ไป-กลับแล้ววิเคราะห์หน่อยว่าทางเดียวกันหรือไม่",
+    )
+
+    assert result is not None
+    assert result.additional_kwargs["phase"] == "symmetry_repair"
+    assert "สมมาตร" in result.content
+    assert "10.255.10.14" in result.content
+    assert "172.16.10.1" in result.content
+
+
+def test_synthesize_final_answer_repairs_route_language_and_destination_owner():
+    from src.graph.agents.free_run_agent import _synthesize_final_answer
+    from langchain_core.messages import SystemMessage
+
+    class DummyAnswerLLM:
+        def __init__(self):
+            self.calls = []
+
+        def invoke(self, messages):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return AIMessage(
+                    content=(
+                        "Best path คือ HQ-CORE-RT01 -> HQ-DIST-GW01 -> BRANCH-A-RTR\n"
+                        "จบทarget device: 192.168.99.11"
+                    )
+                )
+            return AIMessage(
+                content=(
+                    "Best path จาก HQ-CORE-RT01 ไป 192.168.99.11 คือออก GigabitEthernet0/2 ไปหา 10.255.10.14 "
+                    "ที่ HQ-DIST-GW01 จากนั้นออก Tunnel10 ไปหา 172.16.10.2 ที่ BRANCH-A-RTR "
+                    "ก่อนส่งต่อเข้าเครือข่าย 192.168.99.0/24 ผ่าน GigabitEthernet0/3.99\n"
+                    "ปลายทางคือ BRANCH-A-Switch Vlan99 (192.168.99.11)"
+                )
+            )
+
+    result = _synthesize_final_answer(
+        answer_llm=DummyAnswerLLM(),
+        system_msg=SystemMessage(content="system"),
+        device_cache={
+            "HQ-CORE-RT01": {"device_role": "core_router"},
+            "HQ-DIST-GW01": {"device_role": "dist_switch"},
+            "BRANCH-A-RTR": {"device_role": "router"},
+            "BRANCH-A-Switch": {"device_role": "access_switch"},
+        },
+        original_context=[
+            HumanMessage(
+                content="จาก HQ-CORE-RT01 route ไป 192.168.99.11 ตอนนี้ best path คืออะไร ช่วยไล่ให้ครบว่าออก interface ไหน, next-hop อะไร, ผ่าน transit network ไหนบ้าง, แล้วไปจบที่ device/interface ไหน"
+            )
+        ],
+        session_messages=[
+            HumanMessage(
+                content="จาก HQ-CORE-RT01 route ไป 192.168.99.11 ตอนนี้ best path คืออะไร ช่วยไล่ให้ครบว่าออก interface ไหน, next-hop อะไร, ผ่าน transit network ไหนบ้าง, แล้วไปจบที่ device/interface ไหน"
+            )
+        ],
+        result_messages=[
+            ToolMessage(
+                content=(
+                    "[Device: HQ-CORE-RT01 | IP: 10.255.1.11 | OS: cisco_ios]\n"
+                    "Routing entry for 192.168.99.0/24\n"
+                    "  Known via \"ospf 10\", distance 110, metric 21\n"
+                    "  * 10.255.10.14, from 10.255.2.21, via GigabitEthernet0/2\n"
+                ),
+                tool_call_id="call-1",
+                name="run_cli",
+                additional_kwargs={
+                    "tool_args": {"host": "HQ-CORE-RT01", "command": "show ip route 192.168.99.11"},
+                    "tool_status": "success",
+                },
+            ),
+            ToolMessage(
+                content=(
+                    "[Device: HQ-DIST-GW01 | IP: 10.255.2.21 | OS: cisco_ios]\n"
+                    "Routing entry for 192.168.99.0/24\n"
+                    "  Known via \"eigrp 100\", distance 90, metric 25856256, type internal\n"
+                    "  * 172.16.10.2, from 172.16.10.2, via Tunnel10\n"
+                ),
+                tool_call_id="call-2",
+                name="run_cli",
+                additional_kwargs={
+                    "tool_args": {"host": "HQ-DIST-GW01", "command": "show ip route 192.168.99.11"},
+                    "tool_status": "success",
+                },
+            ),
+            ToolMessage(
+                content=(
+                    "[Device: BRANCH-A-RTR | IP: 10.255.3.101 | OS: cisco_ios]\n"
+                    "Routing entry for 192.168.99.0/24\n"
+                    "  Known via \"connected\", distance 0, metric 0 (connected)\n"
+                    "  * directly connected, via GigabitEthernet0/3.99\n"
+                ),
+                tool_call_id="call-3",
+                name="run_cli",
+                additional_kwargs={
+                    "tool_args": {"host": "BRANCH-A-RTR", "command": "show ip route 192.168.99.11"},
+                    "tool_status": "success",
+                },
+            ),
+        ],
+        user_query="จาก HQ-CORE-RT01 route ไป 192.168.99.11 ตอนนี้ best path คืออะไร ช่วยไล่ให้ครบว่าออก interface ไหน, next-hop อะไร, ผ่าน transit network ไหนบ้าง, แล้วไปจบที่ device/interface ไหน",
+    )
+
+    assert result is not None
+    assert result.additional_kwargs["phase"] == "route_repair"
+    assert "ปลายทางคือ BRANCH-A-Switch Vlan99" in result.content
+    assert "จบทarget device" not in result.content
+
+
 def test_execute_run_cli_batch_runs_calls_concurrently_and_preserves_order():
     from src.graph.agents.free_run_agent import _execute_run_cli_batch
 
@@ -1108,4 +1438,76 @@ def test_relationship_queries_add_relationship_specific_synthesis_instruction():
         "For `Limitations`, prefer short bullet points" in str(msg.content)
         for call in llm.calls
         for msg in call
+    )
+
+
+def test_free_run_node_answers_from_existing_incident_evidence_before_running_tools():
+    from src.graph.agents.free_run_agent import free_run_node
+
+    class UnexpectedToolLLM:
+        def bind_tools(self, _tools):
+            raise AssertionError("tool-calling LLM should not run for existing-evidence follow-ups")
+
+    class DummyAnswerLLM:
+        def __init__(self):
+            self.calls = []
+
+        def invoke(self, messages):
+            self.calls.append(messages)
+            return AIMessage(content="ควรแก้ปัญหา SSH ที่บันทึกไว้ก่อน แล้วค่อยตรวจ BGP จากหลักฐานเดิม")
+
+    class DummyRunCliTool:
+        def invoke(self, _args):
+            raise AssertionError("run_cli should not execute when recorded incident evidence is sufficient")
+
+    answer_llm = DummyAnswerLLM()
+    result = free_run_node(
+        {
+            "messages": [
+                HumanMessage(
+                    content=(
+                        "[System: Existing incident troubleshoot evidence]\n"
+                        "Recorded troubleshoot summary: Assessment: SSH failed to HQ-CORE-RT01."
+                    )
+                ),
+                ToolMessage(
+                    content="[SSH ERROR] 10.255.1.11 (OS: cisco_ios): timed out",
+                    tool_call_id="preloaded-1",
+                    name="run_cli",
+                    additional_kwargs={
+                        "tool_args": {"host": "HQ-CORE-RT01", "command": "show ip bgp summary"},
+                        "tool_status": "error",
+                        "source": "incident_troubleshoot",
+                    },
+                ),
+                HumanMessage(content="ควรเช็คอะไรต่อดี"),
+            ],
+            "device_cache": {
+                "HQ-CORE-RT01": {
+                    "ip_address": "10.255.1.11",
+                    "os_platform": "cisco_ios",
+                    "device_role": "router",
+                    "site": "HQ",
+                    "version": "15.6(2)T",
+                }
+            },
+            "incident_context": (
+                "Incident: INC-000001\n"
+                "Recorded Troubleshoot Result:\n"
+                "  Summary: Assessment: SSH failed to HQ-CORE-RT01.\n"
+            ),
+        },
+        llm=UnexpectedToolLLM(),
+        answer_llm=answer_llm,
+        run_cli_tool=DummyRunCliTool(),
+    )
+
+    assert len(result["messages"]) == 1
+    assert isinstance(result["messages"][0], AIMessage)
+    assert "SSH" in result["messages"][0].content
+    assert answer_llm.calls
+    assert any(
+        "Do not pretend a fresh check happened." in str(msg.content)
+        for msg in answer_llm.calls[0]
+        if hasattr(msg, "content")
     )

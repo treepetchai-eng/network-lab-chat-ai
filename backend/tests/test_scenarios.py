@@ -115,6 +115,15 @@ class TestInventoryLookupByIP:
         d = self._call("192.168.199.11")
         assert d["hostname"] == "BRANCH-B-Switch"
 
+    def test_transit_interface_ip_resolves_owner_device(self):
+        d = self._call("10.255.10.14")
+        assert d["hostname"] == "HQ-DIST-GW01"
+        assert d["ip_address"] == "10.255.2.21"
+        assert d["resolved_via"] == "interface_ip"
+        assert d["matched_value"] == "10.255.10.14"
+        assert d["matched_interface"]["name"] == "GigabitEthernet0/1"
+        assert d["matched_interface"]["network_cidr"] == "10.255.10.12/30"
+
     def test_unknown_ip_returns_error(self):
         d = self._call("1.2.3.4")
         assert "error" in d
@@ -137,6 +146,38 @@ class TestListAllDevices:
                 assert field in row
 
 
+class TestInterfaceInventoryResolvers:
+    def test_resolve_ip_context_returns_exact_and_connected_matches(self):
+        from src.tools.interface_inventory import resolve_ip_context
+
+        context = resolve_ip_context("192.168.99.11")
+        exact_matches = {
+            (row["hostname"], row["interface_name"])
+            for row in context["exact_matches"]
+        }
+        network_matches = {
+            (row["hostname"], row["interface_name"])
+            for row in context["network_matches"]
+        }
+
+        assert ("BRANCH-A-Switch", "Vlan99") in exact_matches
+        assert ("BRANCH-A-Switch", "Vlan99") in network_matches
+        assert ("BRANCH-A-RTR", "GigabitEthernet0/3.99") in network_matches
+
+    def test_resolve_prefix_context_returns_exact_connected_owners(self):
+        from src.tools.interface_inventory import resolve_prefix_context
+
+        context = resolve_prefix_context("192.168.99.0/24")
+        exact_matches = {
+            (row["hostname"], row["interface_name"])
+            for row in context["exact_matches"]
+        }
+
+        assert context["normalized_prefix"] == "192.168.99.0/24"
+        assert ("BRANCH-A-Switch", "Vlan99") in exact_matches
+        assert ("BRANCH-A-RTR", "GigabitEthernet0/3.99") in exact_matches
+
+
 class TestPromptCoverage:
     def test_full_prompt_matches_free_run_architecture(self):
         from src.prompts.ssh import SSH_PROMPT
@@ -151,6 +192,8 @@ class TestPromptCoverage:
         assert "show ip sla configuration" in SSH_PROMPT
         assert "show track" in SSH_PROMPT
         assert "show interfaces trunk" in SSH_PROMPT
+        assert "run_diagnostic(host, kind, target, count=2, timeout=1)" in SSH_PROMPT
+        assert "Prefer run_diagnostic for `ping` and `traceroute`" in SSH_PROMPT
         assert "Start with the simplest direct command" in SSH_PROMPT
         assert "avoid large ASCII topology diagrams" in SSH_PROMPT
 
@@ -162,6 +205,8 @@ class TestPromptCoverage:
         assert "show ip sla summary" in SSH_COMPACT_PROMPT
         assert "show track" in SSH_COMPACT_PROMPT
         assert "show processes memory" in SSH_COMPACT_PROMPT
+        assert "run_diagnostic(host, kind, target, count=2, timeout=1)" in SSH_COMPACT_PROMPT
+        assert "Prefer run_diagnostic for ping/traceroute" in SSH_COMPACT_PROMPT
         assert "do not start route/default-route checks" in SSH_COMPACT_PROMPT
 
     def test_synthesis_prompt_blocks_inventory_only_health_claims(self):
@@ -175,9 +220,37 @@ class TestPromptCoverage:
         assert "`show ip protocols` proves protocol presence/configuration" in SSH_SYNTHESIS_PROMPT
         assert "Confirmed physical links" in SSH_SYNTHESIS_PROMPT
         assert "Logical relationships" in SSH_SYNTHESIS_PROMPT
+        assert "avoid half-translated labels" in SSH_SYNTHESIS_PROMPT
+        assert "End with the final destination device/interface" in SSH_SYNTHESIS_PROMPT
 
 
 class TestFormatters:
+    def test_fmt_lookup_renders_interface_ip_resolution(self):
+        from src.formatters import fmt_lookup
+
+        raw = json.dumps({
+            "hostname": "HQ-DIST-GW01",
+            "ip_address": "10.255.2.21",
+            "os_platform": "cisco_ios",
+            "device_role": "dist_switch",
+            "site": "HQ",
+            "version": "15.6(2)T",
+            "resolved_via": "interface_ip",
+            "matched_value": "10.255.10.14",
+            "matched_interface": {
+                "name": "GigabitEthernet0/1",
+                "ip_address": "10.255.10.14",
+                "network_cidr": "10.255.10.12/30",
+                "description": "TO-HQ-CORE-RT01 Gi0/2",
+                "interface_mode": "routed",
+            },
+        })
+
+        rendered = fmt_lookup(raw)
+        assert "Resolved via: interface IP 10.255.10.14" in rendered
+        assert "Matched Interface: GigabitEthernet0/1" in rendered
+        assert "Interface Network: 10.255.10.12/30" in rendered
+
     def test_parse_output_handles_command_repair_prefix(self):
         from src.formatters import parse_output
 
@@ -200,6 +273,13 @@ class TestFormatters:
         assert is_error("[AUTH ERROR] Authentication failed")
         assert is_error("[TIMEOUT ERROR] timed out")
         assert not is_error("BGP router identifier 10.255.1.11")
+
+    def test_is_error_detects_cli_syntax_errors(self):
+        from src.formatters import is_error
+
+        assert is_error("% Invalid input detected at '^' marker.")
+        assert is_error("% Incomplete command.")
+        assert is_error("% Ambiguous command:  \"show ip\"")
 
 
 class TestRunCliTool:
@@ -241,6 +321,68 @@ class TestRunCliTool:
         output = run_cli.invoke({"host": "HQ-CORE-RT01", "command": "show ip bgp summary"})
         mock_execute.assert_called_once_with("10.255.1.11", "cisco_ios", "show ip bgp summary")
         assert output.endswith("\nOK")
+
+
+class TestDiagnosticTool:
+    @patch("src.tools.diagnostic_tool.execute_cli")
+    def test_traceroute_resolves_target_and_renders_safe_command(self, mock_execute):
+        from src.tools.diagnostic_tool import create_run_diagnostic_tool
+
+        mock_execute.return_value = (
+            "[Device: HQ-CORE-RT01 | IP: 10.255.1.11 | OS: cisco_ios]\n"
+            "Type escape sequence to abort.\n"
+            "Tracing the route to 192.168.99.11\n"
+            "  1 172.16.10.2 1 msec 2 msec 2 msec\n"
+            "  2 192.168.99.11 3 msec 3 msec 3 msec\n"
+        )
+        run_diagnostic = create_run_diagnostic_tool({
+            "HQ-CORE-RT01": {
+                "ip_address": "10.255.1.11",
+                "os_platform": "cisco_ios",
+                "device_role": "core_router",
+                "site": "HQ",
+            }
+        })
+
+        output = run_diagnostic.invoke({
+            "host": "HQ-CORE-RT01",
+            "kind": "traceroute",
+            "target": "BRANCH-A-Switch",
+        })
+
+        mock_execute.assert_called_once_with("10.255.1.11", "cisco_ios", "traceroute 192.168.99.11")
+        assert "[EXECUTED COMMAND] traceroute 192.168.99.11" in output
+        assert "[RESOLVED TARGET] BRANCH-A-Switch (192.168.99.11)" in output
+        assert "[TRACE TARGET CONTEXT]" in output
+        assert "BRANCH-A-Switch Vlan99" in output
+        assert "BRANCH-A-RTR GigabitEthernet0/3.99" in output
+        assert "[TRACE HOP ANNOTATION]" in output
+        assert "hop 1: 172.16.10.2 -> exact=BRANCH-A-RTR Tunnel10" in output
+
+    @patch("src.tools.diagnostic_tool.execute_cli")
+    def test_ping_uses_semantic_renderer_for_ios(self, mock_execute):
+        from src.tools.diagnostic_tool import create_run_diagnostic_tool
+
+        mock_execute.return_value = "[Device: HQ-CORE-RT01 | IP: 10.255.1.11 | OS: cisco_ios]\nping ok"
+        run_diagnostic = create_run_diagnostic_tool({
+            "HQ-CORE-RT01": {
+                "ip_address": "10.255.1.11",
+                "os_platform": "cisco_ios",
+                "device_role": "core_router",
+                "site": "HQ",
+            }
+        })
+
+        output = run_diagnostic.invoke({
+            "host": "HQ-CORE-RT01",
+            "kind": "ping",
+            "target": "192.168.99.11",
+            "count": 3,
+            "timeout": 2,
+        })
+
+        mock_execute.assert_called_once_with("10.255.1.11", "cisco_ios", "ping 192.168.99.11 repeat 3 timeout 2")
+        assert "[EXECUTED COMMAND] ping 192.168.99.11 repeat 3 timeout 2" in output
 
 
 class TestSSHExecutorCredentialCheck:

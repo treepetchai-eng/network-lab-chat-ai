@@ -7,6 +7,8 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from langchain_core.messages import BaseMessage
+
 from src.graph import build_graph
 
 # ---------------------------------------------------------------------------
@@ -23,6 +25,8 @@ class SessionData:
     device_cache: dict
     graph: object  # CompiledStateGraph
     incident_context: str = ""  # Non-empty for incident-scoped chat sessions
+    preloaded_messages: list[BaseMessage] = field(default_factory=list)
+    preloaded_seeded: bool = False
     progress_sink: dict = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_active: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -44,6 +48,7 @@ async def create_session(
     *,
     incident_context: str = "",
     device_cache_prefill: dict | None = None,
+    preloaded_messages: list[BaseMessage] | None = None,
 ) -> SessionData:
     """Create a new session with a fresh graph and empty grounded cache.
 
@@ -52,6 +57,8 @@ async def create_session(
             the LLM system prompt for incident-scoped chat sessions.
         device_cache_prefill: Optional device entries to pre-populate the cache
             so the LLM doesn't need to call lookup_device for known devices.
+        preloaded_messages: Optional conversation/tool evidence that should be
+            seeded into the graph on the first user turn only.
     """
     session_id = str(uuid.uuid4())
     thread_id = str(uuid.uuid4())
@@ -65,6 +72,7 @@ async def create_session(
         device_cache=device_cache,
         graph=graph,
         incident_context=incident_context,
+        preloaded_messages=list(preloaded_messages or []),
         progress_sink=progress_sink,
     )
 

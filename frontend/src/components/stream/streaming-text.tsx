@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { MarkdownRenderer } from "@/components/markdown/markdown-renderer";
 
 interface Props {
@@ -10,11 +10,10 @@ interface Props {
 }
 
 /**
- * Streaming text with character-by-character reveal and live Markdown rendering.
+ * Streaming text with character-by-character reveal.
  *
- * The animation cadence is tuned so the text always appears to "type" at a
- * human-readable pace — fast enough that it doesn't slow down long answers,
- * but slow enough that users perceive real streaming instead of an instant dump.
+ * During live streaming we render lightweight plain text, then switch to the
+ * full Markdown renderer once the final response is complete.
  */
 export function StreamingText({ tokens, isComplete, finalContent, onAnimationComplete }: Props) {
   const [visibleLen, setVisibleLen] = useState(0);
@@ -100,6 +99,8 @@ export function StreamingText({ tokens, isComplete, finalContent, onAnimationCom
 
   // Once complete AND the animation has caught up, signal parent & show final Markdown
   const animationDone = isComplete && finalContent && visibleLen >= finalContent.length;
+  const visibleText = targetText.slice(0, visibleLen);
+  const deferredVisibleText = useDeferredValue(visibleText);
 
   useEffect(() => {
     if (animationDone && !completedRef.current) {
@@ -114,16 +115,13 @@ export function StreamingText({ tokens, isComplete, finalContent, onAnimationCom
     return <MarkdownRenderer content={finalContent!} />;
   }
 
-  const visibleText = targetText.slice(0, visibleLen);
   const stillAnimating = visibleLen < targetText.length;
 
   return (
     <div className="relative">
-      {/* Render visible portion as Markdown for professional formatting */}
-      <div className="ui-copy text-slate-100">
-        <MarkdownRenderer content={visibleText} />
+      <div className="ui-copy whitespace-pre-wrap break-words text-slate-100">
+        {deferredVisibleText}
       </div>
-      {/* Blinking cursor with glow while still animating */}
       {stillAnimating && (
         <span className="inline-block h-[1.1em] w-[2.5px] translate-y-0.5 rounded-full bg-cyan-300 align-baseline animate-stream-caret ml-0.5 shadow-[0_0_8px_rgba(103,232,249,0.6),0_0_16px_rgba(103,232,249,0.3)]" />
       )}

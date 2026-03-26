@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 from langchain_core.tools import tool
+from src.tools.interface_inventory import resolve_ip_context
 
 _INVENTORY_PATH = Path(__file__).parent.parent.parent / "inventory" / "inventory.csv"
 _IP_RE = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
@@ -21,27 +22,130 @@ def _load_rows() -> list[dict]:
     return _ROWS_CACHE
 
 
-def _row_to_json(row: dict) -> str:
+def _split_tunnel_ips(row: dict) -> list[str]:
     tunnel_ips_raw = row.get("tunnel_ips", "") or ""
-    tunnel_ips = [ip.strip() for ip in tunnel_ips_raw.split() if ip.strip()]
-    return json.dumps({
+    return [ip.strip() for ip in tunnel_ips_raw.split() if ip.strip()]
+
+
+def _row_payload(row: dict) -> dict:
+    return {
         "hostname":    row["hostname"],
         "ip_address":  row["ip_address"],
         "os_platform": row["os_platform"],
         "device_role": row["device_role"],
         "site":        row["site"],
         "version":     row["version"],
-        "tunnel_ips":  tunnel_ips,
-    })
+        "tunnel_ips":  _split_tunnel_ips(row),
+    }
+
+
+def _row_to_json(row: dict, **extras) -> str:
+    payload = _row_payload(row)
+    payload.update(extras)
+    return json.dumps(payload)
+
+
+def _resolve_exact_interface_owner(ip_value: str) -> dict | None:
+    context = resolve_ip_context(ip_value)
+    exact_matches = context.get("exact_matches", [])
+    if not exact_matches:
+        return None
+
+    rows = _load_rows()
+    owners: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for interface_row in exact_matches:
+        hostname = str(interface_row.get("hostname", "") or "").strip()
+        interface_name = str(interface_row.get("interface_name", "") or "").strip()
+        if not hostname or (hostname, interface_name) in seen:
+            continue
+        seen.add((hostname, interface_name))
+
+        inventory_row = next(
+            (dict(row) for row in rows if row.get("hostname", "").lower() == hostname.lower()),
+            None,
+        )
+        owners.append({
+            "inventory_row": inventory_row,
+            "interface": {
+                "name": interface_name,
+                "ip_address": str(interface_row.get("ip_address", "") or "").strip(),
+                "network_cidr": str(interface_row.get("network_cidr", "") or "").strip(),
+                "description": str(interface_row.get("description", "") or "").strip(),
+                "interface_mode": str(interface_row.get("interface_mode", "") or "").strip(),
+                "parent_interface": str(interface_row.get("parent_interface", "") or "").strip(),
+            },
+        })
+
+    if not owners:
+        return None
+
+    unique_hosts = {
+        str(item["inventory_row"].get("hostname", "") or item["interface"]["name"])
+        for item in owners
+        if item.get("inventory_row")
+    }
+    if len(unique_hosts) > 1:
+        return {
+            "error": f"Exact interface IP '{ip_value}' maps to multiple device owners.",
+            "candidates": [
+                {
+                    "hostname": item["inventory_row"].get("hostname", ""),
+                    "ip_address": item["inventory_row"].get("ip_address", ""),
+                    "interface": item["interface"],
+                }
+                for item in owners
+                if item.get("inventory_row")
+            ],
+        }
+
+    selected = owners[0]
+    inventory_row = selected.get("inventory_row")
+    if not inventory_row:
+        return None
+    return {
+        **_row_payload(inventory_row),
+        "resolved_via": "interface_ip",
+        "matched_value": ip_value,
+        "matched_interface": selected["interface"],
+    }
+
+
+def resolve_inventory_record(identifier: str) -> dict | None:
+    """Resolve a device record by exact hostname, IP, or tunnel IP.
+
+    This helper is intentionally non-tooling so backend execution helpers can
+    normalize targets without forcing the LLM to perform another tool round-trip.
+    """
+    search = (identifier or "").strip()
+    if not search:
+        return None
+
+    rows = _load_rows()
+
+    if _IP_RE.match(search):
+        for row in rows:
+            if row["ip_address"] == search:
+                return dict(row)
+        for row in rows:
+            tunnel_ips = _split_tunnel_ips(row)
+            if search in tunnel_ips:
+                return dict(row)
+        return None
+
+    for row in rows:
+        if row["hostname"].lower() == search.lower():
+            return dict(row)
+    return None
 
 
 @tool
 def lookup_device(hostname: str) -> str:
-    """Look up a network device in the inventory by hostname OR IP address.
+    """Look up a network device by hostname, management IP, tunnel IP, or exact interface IP.
 
     Accepts:
       - Exact hostname  (e.g. ``HQ-CORE-RT01``)  — case-insensitive
-      - IPv4 address    (e.g. ``10.255.1.11``)    — exact match
+      - IPv4 address    (e.g. ``10.255.1.11``)    — management/tunnel/interface exact match
 
     If no exact match is found, returns suggestions so the caller can retry
     with the correct name.
@@ -60,27 +164,27 @@ def lookup_device(hostname: str) -> str:
         return json.dumps({"error": f"Failed to read inventory: {exc}"})
 
     search = hostname.strip()
+    resolved = resolve_inventory_record(search)
+    if resolved:
+        resolved_via = "hostname"
+        if _IP_RE.match(search):
+            tunnel_ips = _split_tunnel_ips(resolved)
+            resolved_via = "management_ip" if resolved.get("ip_address") == search else "tunnel_ip" if search in tunnel_ips else "ip"
+        return _row_to_json(resolved, resolved_via=resolved_via, matched_value=search)
 
-    # 1. IP address lookup (exact match on ip_address column)
     if _IP_RE.match(search):
-        for row in rows:
-            if row["ip_address"] == search:
-                return _row_to_json(row)
-        # 1b. Tunnel/interface IP match
-        for row in rows:
-            tunnel_ips_raw = row.get("tunnel_ips", "") or ""
-            tunnel_ips = [ip.strip() for ip in tunnel_ips_raw.split() if ip.strip()]
-            if search in tunnel_ips:
-                return _row_to_json(row)
+        interface_owner = _resolve_exact_interface_owner(search)
+        if interface_owner:
+            if "error" in interface_owner:
+                return json.dumps(interface_owner)
+            return json.dumps(interface_owner)
+
+    # 1. IP address lookup (exact match on device or interface IP columns)
+    if _IP_RE.match(search):
         return json.dumps({
-            "error":       f"No device with IP '{search}' in inventory.",
+            "error":       f"No device or exact interface owner with IP '{search}' in inventory.",
             "suggestions": [r["hostname"] for r in rows],
         })
-
-    # 2. Exact hostname match (case-insensitive)
-    for row in rows:
-        if row["hostname"].lower() == search.lower():
-            return _row_to_json(row)
 
     # 3. Partial hostname match — return suggestions
     suggestions = [r["hostname"] for r in rows if search.lower() in r["hostname"].lower()]

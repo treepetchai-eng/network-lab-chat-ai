@@ -8,12 +8,13 @@ const MAX_MESSAGE_LENGTH = 2000;
 interface StickyComposerProps {
   onSend: (message: string) => void;
   disabled: boolean;
-  onDraftChange?: (value: string) => void;
+  onDraftPresenceChange?: (hasDraft: boolean) => void;
 }
 
-export function StickyComposer({ onSend, disabled, onDraftChange }: StickyComposerProps) {
+export function StickyComposer({ onSend, disabled, onDraftPresenceChange }: StickyComposerProps) {
   const [value, setValue] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const hasDraftRef = useRef(false);
 
   const resize = () => {
     if (!textareaRef.current) return;
@@ -21,16 +22,25 @@ export function StickyComposer({ onSend, disabled, onDraftChange }: StickyCompos
     textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 200)}px`;
   };
 
+  const syncDraftPresence = useCallback((nextValue: string) => {
+    const nextHasDraft = nextValue.trim().length > 0;
+    if (hasDraftRef.current === nextHasDraft) {
+      return;
+    }
+    hasDraftRef.current = nextHasDraft;
+    onDraftPresenceChange?.(nextHasDraft);
+  }, [onDraftPresenceChange]);
+
   const handleSend = useCallback(() => {
     const next = value.trim();
     if (!next || disabled) return;
     onSend(next);
     setValue("");
-    onDraftChange?.("");
+    syncDraftPresence("");
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
-  }, [disabled, onDraftChange, onSend, value]);
+  }, [disabled, onSend, syncDraftPresence, value]);
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey) {
@@ -52,7 +62,7 @@ export function StickyComposer({ onSend, disabled, onDraftChange }: StickyCompos
             onChange={(event) => {
               const next = event.target.value.slice(0, MAX_MESSAGE_LENGTH);
               setValue(next);
-              onDraftChange?.(next);
+              syncDraftPresence(next);
               resize();
             }}
             onKeyDown={handleKeyDown}

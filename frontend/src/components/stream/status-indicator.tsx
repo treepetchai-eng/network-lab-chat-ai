@@ -1,5 +1,4 @@
-import { useEffect, useRef, useState } from "react";
-import { motion } from "framer-motion";
+import { useEffect, useState } from "react";
 import { Activity, ServerCog, Zap } from "lucide-react";
 import { PhaseTimeline } from "@/components/stream/phase-timeline";
 import { cn } from "@/lib/utils";
@@ -58,40 +57,27 @@ export function StatusIndicator({ text, history = [], phase, progress = null }: 
 
   // ---------- Simulated progress crawl ----------
   const [simPct, setSimPct] = useState(2);
-  const rafRef = useRef<number | null>(null);
-  const startRef = useRef(0);
 
-  // Reset clock when phase changes
   useEffect(() => {
-    startRef.current = 0;
-  }, [phase]);
-
-  // Animate simulated progress
-  useEffect(() => {
-    // If we have explicit progress, don't simulate
     if (explicitPct !== null) {
       return;
     }
 
     const [lo, hi] = phaseRange(phase);
-    const crawlDuration = 25_000; // ms to crawl from lo to hi
+    const intervalId = window.setInterval(() => {
+      setSimPct((prev) => {
+        const baseline = Math.max(prev, lo);
+        if (baseline >= hi) {
+          return baseline;
+        }
+        const remaining = hi - baseline;
+        const next = baseline + Math.max(0.5, remaining * 0.08);
+        return Math.min(hi, next);
+      });
+    }, 140);
 
-    const tick = () => {
-      const now = performance.now();
-      if (!startRef.current) {
-        startRef.current = now;
-      }
-      const elapsed = now - startRef.current;
-      // Ease-out: fast start, slows down as it approaches the ceiling
-      const t = Math.min(elapsed / crawlDuration, 1);
-      const eased = 1 - Math.pow(1 - t, 2.5);
-      const next = lo + (hi - lo) * eased;
-      setSimPct((prev) => Math.max(prev, next)); // never go backwards
-      rafRef.current = requestAnimationFrame(tick);
-    };
-    rafRef.current = requestAnimationFrame(tick);
     return () => {
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      window.clearInterval(intervalId);
     };
   }, [phase, explicitPct]);
 
@@ -116,14 +102,10 @@ export function StatusIndicator({ text, history = [], phase, progress = null }: 
 
           {/* ---- Progress bar ---- */}
           <div className="relative mt-2 h-2 sm:h-2.5 overflow-hidden rounded-full bg-white/[0.06]">
-            {/* Shimmer overlay */}
             <div className="absolute inset-0 z-10 animate-[shimmer_2s_linear_infinite] bg-[linear-gradient(110deg,transparent_30%,rgba(255,255,255,0.12)_50%,transparent_70%)] bg-[length:200%_100%]" />
-            {/* Fill */}
-            <motion.div
-              className={cn("relative h-full rounded-full bg-gradient-to-r shadow-[0_0_12px_rgba(34,211,238,0.25)]", phaseAccent(phase))}
-              initial={false}
-              animate={{ width: `${displayPct}%` }}
-              transition={{ duration: 0.6, ease: [0.22, 1, 0.36, 1] }}
+            <div
+              className={cn("relative h-full rounded-full bg-gradient-to-r shadow-[0_0_12px_rgba(34,211,238,0.25)] transition-[width] duration-500 ease-out", phaseAccent(phase))}
+              style={{ width: `${displayPct}%` }}
             />
           </div>
 

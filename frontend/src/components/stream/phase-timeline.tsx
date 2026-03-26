@@ -1,6 +1,5 @@
 "use client";
 
-import { motion } from "framer-motion";
 import { cn } from "@/lib/utils";
 
 type Phase = "idle" | "listening" | "grounding" | "planning" | "executing" | "summarizing";
@@ -45,24 +44,22 @@ export function PhaseTimeline({ phase }: PhaseTimelineProps) {
                 <div className="absolute left-[calc(50%+0.75rem)] right-[-0.6rem] top-[0.42rem] h-px bg-white/10" />
               ) : null}
               <div className="relative flex flex-col items-start gap-1">
-                <motion.span
+                <span
                   className={cn(
                     "relative h-3.5 w-3.5 rounded-full border",
                     complete
                       ? "border-emerald-300/30 bg-emerald-300/18"
                       : active
-                        ? "border-cyan-200/45 bg-cyan-300/18"
+                        ? "border-cyan-200/45 bg-cyan-300/18 animate-gentle-pulse"
                         : "border-white/12 bg-white/[0.03]",
                   )}
-                  animate={active ? { scale: [1, 1.08, 1], opacity: [0.75, 1, 0.8] } : {}}
-                  transition={{ duration: 1.4, repeat: Number.POSITIVE_INFINITY, ease: "easeInOut" }}
                 >
                   {active ? (
                     <span className="absolute inset-[2px] rounded-full bg-cyan-100 shadow-[0_0_10px_rgba(165,243,252,0.72)]" />
                   ) : complete ? (
                     <span className="absolute inset-[2px] rounded-full bg-emerald-200" />
                   ) : null}
-                </motion.span>
+                </span>
                 <span
                   className={cn(
                     "text-[0.56rem] sm:text-[0.64rem] font-medium tracking-[0.01em]",

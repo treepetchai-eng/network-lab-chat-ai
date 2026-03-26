@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from urllib.parse import urlparse, urlunparse
@@ -13,11 +14,30 @@ def _normalize_database_url(value: str) -> str:
     return value.replace("postgresql+psycopg://", "postgresql://", 1)
 
 
+def _is_test_runtime() -> bool:
+    return "pytest" in sys.modules or bool(os.getenv("PYTEST_CURRENT_TEST"))
+
+
+def _derive_pytest_database_url(value: str) -> str:
+    override = os.getenv("TEST_DATABASE_URL", "").strip() or os.getenv("PYTEST_DATABASE_URL", "").strip()
+    if override:
+        return _normalize_database_url(override)
+
+    parsed = urlparse(value)
+    database_name = parsed.path.lstrip("/") or "network_aiops"
+    if database_name.endswith("_pytest"):
+        return value
+    return urlunparse(parsed._replace(path=f"/{database_name}_pytest"))
+
+
 def database_url() -> str:
     value = os.getenv("DATABASE_URL", "").strip()
     if not value:
         raise RuntimeError("DATABASE_URL is not configured")
-    return _normalize_database_url(value)
+    normalized = _normalize_database_url(value)
+    if _is_test_runtime():
+        return _derive_pytest_database_url(normalized)
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -47,4 +67,3 @@ def connect(url: str | None = None):
         yield connection
     finally:
         connection.close()
-
