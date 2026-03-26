@@ -26,6 +26,11 @@ _MAX_COMMANDS = int(os.getenv("ADVISORY_CHECK_MAX_COMMANDS", "5"))
 
 # ── Full advisory page cache (text rarely changes, safe to cache) ──────────
 _page_cache: dict[str, str] = {}
+
+_WORKAROUND_SECTION_RE = re.compile(
+    r"(?:^|\n)Workarounds?\s*\n(.*?)(?=\n(?:Fixed Software|Recommendations|Exploitation|Source|Cisco Bug|Details|Affected|References|Legal Disclaimer|\Z))",
+    re.DOTALL | re.IGNORECASE,
+)
 _page_cache_lock = threading.Lock()
 
 
@@ -197,12 +202,30 @@ def check_advisory_impact(
         if full_page:
             advisory_text = f"=== FULL ADVISORY PAGE ===\n{full_page}"
             _emit("status", {"message": "Analyzing advisory..."})
+            # Extract workaround section from full page
+            wa_match = _WORKAROUND_SECTION_RE.search(full_page)
+            wa_text = wa_match.group(1).strip()[:2000] if wa_match else ""
+            if not wa_text:
+                has_workaround = not bool(re.search(r"(?i)there (?:are|is) no workaround", full_page))
+                if not has_workaround:
+                    wa_text = "No workaround is available. Upgrade to a fixed software release."
+                else:
+                    wa_text = ""  # Has workaround but couldn't extract text
+            else:
+                has_workaround = "no workaround" not in wa_text.lower()[:120]
+            _emit("workaround", {"has_workaround": has_workaround, "workaround_text": wa_text})
         else:
             advisory_text = (
                 f"=== ADVISORY DESCRIPTION ===\n{summary}\n\n"
                 f"Workaround / Mitigation:\n{workaround}"
             )
             _emit("status", {"message": "Page fetch failed, using API summary"})
+            # Emit workaround from DB field as fallback
+            if workaround:
+                no_wa = "no workaround" in workaround.lower()[:120]
+                _emit("workaround", {"has_workaround": not no_wa, "workaround_text": workaround})
+            else:
+                _emit("workaround", {"has_workaround": False, "workaround_text": "Workaround status unknown — advisory page unavailable."})
 
         plan_prompt = (
             "You are a Cisco network security engineer.\n\n"
@@ -226,11 +249,24 @@ def check_advisory_impact(
             "CASE B — The CVE is in a core/always-on component.\n"
             "  (No specific feature needs to be enabled — all devices with this version are affected)\n"
             "  → Return: {\"case\":\"B\",\"feature\":\"...\",\"explanation\":\"...\"}\n\n"
+            "CASE C — The CVE is a configuration line length / truncation vulnerability.\n"
+            "  (Advisory mentions '255 characters', 'truncated', 'character limit', or 'line length')\n"
+            "  The device is only affected if:\n"
+            "    1. The feature IS configured (startup-config has the relevant line), AND\n"
+            "    2. That startup-config line exceeds the character limit after encryption.\n"
+            "  → Include ALL of these commands (replace <keyword> with the config keyword, e.g. snmp-server user):\n"
+            "       show running-config | include <keyword>     ← check if feature exists\n"
+            "       show startup-config | include <keyword>     ← get the encrypted/stored line to count chars\n"
+            "       show snmp user                              ← (SNMP only) verify ACL name truncation\n"
+            "  → Use 'show snmp user' NOT 'show snmp user all' (invalid command on IOS).\n"
+            "  → Return: {\"case\":\"C\",\"feature\":\"...\",\"char_limit\":255,\"keyword\":\"<config keyword>\","
+            "\"commands\":[\"cmd1\",\"cmd2\",...]}\n\n"
             "CASE A rules:\n"
             "- Do NOT use `show version` — it only shows version, not feature status.\n"
             "- If the advisory says 'use show run | include X to check', use THAT command.\n"
             "- Use: show running-config | section <feature>\n"
             "- Use: show running-config | include <keyword>\n"
+            "- Never use 'show snmp user all' — correct command is 'show snmp user' or 'show snmp user <name>'.\n"
         )
 
         llm_plan  = create_chat_model(reasoning=True)
@@ -242,8 +278,10 @@ def check_advisory_impact(
                     advisory_id, plan.get("case"), plan.get("feature"),
                     plan.get("commands"), plan_text[:300])
 
-        feature  = plan.get("feature", title)
-        commands = plan.get("commands") or []
+        feature    = plan.get("feature", title)
+        commands   = plan.get("commands") or []
+        case       = plan.get("case", "A")
+        char_limit = int(plan.get("char_limit") or 255) if case == "C" else 0
 
         _emit("plan", {"feature": feature, "commands": commands})
 
@@ -262,7 +300,7 @@ def check_advisory_impact(
                 "commands_run": [],
             }
 
-        # ── CASE A: Run commands via SSH ───────────────────────────────────────
+        # ── CASE A / C: Run commands via SSH ──────────────────────────────────
 
         if not commands:
             commands = ["show version"]
@@ -288,6 +326,30 @@ def check_advisory_impact(
             f"$ {cr['command']}\n{cr['output'][:1000]}" for cr in commands_run
         )
 
+        case_c_rules = (
+            f"\n\nCASE C — CONFIG LINE LENGTH / TRUNCATION CHECK (char_limit={char_limit}):\n"
+            "\n"
+            "IMPORTANT — 'show snmp user' (and similar) output is REAL DATA, never 'cached' or 'artifact':\n"
+            "  storage-type: nonvolatile = user IS persistently stored in NVRAM\n"
+            "  storage-type: volatile    = user exists only in RAM (not affected by reload truncation)\n"
+            "\n"
+            "STEP 1 — Check if feature is configured at all:\n"
+            "  - 'show running-config | include <keyword>' EMPTY AND 'show snmp user' also empty → not_affected\n"
+            "  - 'show running-config | include <keyword>' EMPTY BUT 'show snmp user' shows user(s):\n"
+            "      → User IS configured (IOS stores snmp users in NVRAM separately from running-config)\n"
+            "      → Proceed to Step 2\n"
+            "\n"
+            "STEP 2 — Check if ACL is attached (required for truncation to matter):\n"
+            "  - 'show snmp user' output has NO 'access-list:' line → user has no ACL → not_affected\n"
+            "  - 'show snmp user' output HAS 'access-list: <name>' → ACL is attached → proceed to Step 3\n"
+            "\n"
+            "STEP 3 — Check startup-config line length:\n"
+            f"  - 'show startup-config | include <keyword>' line length > {char_limit} chars → affected\n"
+            f"  - 'show startup-config | include <keyword>' line length ≤ {char_limit} chars → not_affected\n"
+            "  - 'show snmp user' shows access-list name truncated mid-word (e.g. 'ACL-ALLOW_S' instead of 'ACL-ALLOW_SNMP') → affected\n"
+            "  - startup-config empty but user has ACL → uncertain (need to check full startup-config)\n"
+        ) if case == "C" else ""
+
         assess_prompt = (
             "/no_think\n"
             f"Advisory: [{sir}] {title}\n"
@@ -307,7 +369,8 @@ def check_advisory_impact(
             "- Service status shows Enabled/Active → affected\n"
             "- '% Invalid input' → command not supported → not_affected\n"
             "- Feature exists but explicitly disabled → not_affected\n"
-            "- Use uncertain ONLY if ALL commands returned SSH errors\n\n"
+            "- Use uncertain ONLY if ALL commands returned SSH errors\n"
+            f"{case_c_rules}\n"
             "Return ONLY JSON:\n"
             '{"verdict":"affected|not_affected","confidence":0.85-1.0,"explanation":"<cite the EXACT output>"}'
         )
