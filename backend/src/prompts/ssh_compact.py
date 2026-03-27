@@ -62,6 +62,9 @@ Command rules:
 Scope rules:
 - One device named → stay on that device.
 - "all devices" / "ทุกตัว" → list_all_devices first, then check every relevant device in scope.
+- Role words like `core_router`, `dist_switch`, `router`, `access_switch` refer to
+  inventory device roles, not hostnames. If the user uses a role as the scope,
+  treat it as all matching inventory devices in that role.
 - For follow-up requests in the same session, reuse already collected evidence
   from context and gather only the missing evidence needed to answer.
 - Do not restart the whole topology/protocol sweep or re-run the same evidence

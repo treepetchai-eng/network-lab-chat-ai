@@ -17,30 +17,55 @@ from psycopg.types.json import Json
 from src.aiops.db import connect, parse_database_urls
 from src.aiops.llm import decide_incident_bundle, generate_ai_summary, run_llm_troubleshoot
 from src.aiops.parser import parse_syslog
+from src.tools.interface_inventory import resolve_link_context
 from src.tools.config_executor import execute_config, run_show_commands
 
 _INVENTORY_PATH = Path(__file__).parent.parent.parent / "inventory" / "inventory.csv"
 _OPEN_INCIDENT_STATUSES = (
-    "new",
-    "triaged",
-    "investigating",
     "active",
     "recovering",
     "monitoring",
-    "awaiting_approval",
-    "approved",
-    "executing",
-    "verifying",
-    "reopened",
-    "escalated",
 )
 _PIPELINE_STATUSES = ("pending_parse",)
 _GROUP_WINDOW = timedelta(minutes=10)
+# Primary operator-facing statuses only.
+_PRIMARY_INCIDENT_STATUSES = frozenset({"active", "recovering", "monitoring", "resolved"})
+_ROOT_INCIDENT_ROLE = "root"
+_SYMPTOM_INCIDENT_ROLE = "symptom"
+_RELATED_INCIDENT_PREFIX = "link|"
 # Event states the LLM may return to indicate recovery (not just "up")
 _RECOVERY_EVENT_STATES = frozenset({"up", "resolved", "recovered", "established", "restored", "cleared", "restart"})
 # Incident statuses that indicate the fault was previously considered over — a new DOWN event here is a re-fault
 _POST_RECOVERY_STATUSES = frozenset({"recovering", "monitoring", "resolved", "resolved_uncertain"})
-_REMEDIATION_HOLD_STATUSES = frozenset({"awaiting_approval", "approved", "executing", "escalated"})
+_PENDING_APPROVAL_WORKFLOW_PHASES = frozenset({"remediation_available", "approved_to_execute"})
+_FAULT_PRESERVED_WORKFLOW_PHASES = frozenset({
+    "intent_confirmation_required",
+    "remediation_available",
+    "approved_to_execute",
+    "escalated_physical",
+    "escalated_external",
+})
+_TIME_BASED_AUTO_ADVANCE_WORKFLOW_PHASES = frozenset({
+    "none",
+    "intent_confirmation_required",
+    "remediation_available",
+    "approved_to_execute",
+})
+_LINKED_ADMIN_DOWN_EVENT_FAMILIES = frozenset({"interface", "bgp", "ospf", "eigrp", "tunnel"})
+_TOPOLOGY_ROOT_EVENT_FAMILIES = frozenset({"interface", "bgp", "ospf", "eigrp", "tunnel", "tracking"})
+_LINKED_ADMIN_DOWN_WINDOW_SECONDS = max(1, int(os.getenv("AIOPS_LINKED_ADMIN_DOWN_WINDOW_SECONDS", "120")))
+_RECOVERY_SIGNAL_MONITORING_SECONDS = max(
+    1,
+    int(os.getenv("AIOPS_RECOVERY_SIGNAL_MONITORING_SECONDS", "60")),
+)
+_RECOVERY_STABILITY_SECONDS = max(
+    1,
+    int(os.getenv("AIOPS_RECOVERY_STABILITY_SECONDS", "60")),
+)
+_SYSTEM_BOOT_MONITORING_SECONDS = max(
+    1,
+    int(os.getenv("AIOPS_SYSTEM_BOOT_MONITORING_SECONDS", "60")),
+)
 _GROUP_DECISION_DEBOUNCE = timedelta(seconds=max(1, int(os.getenv("AIOPS_GROUP_DECISION_DEBOUNCE_SECONDS", "5"))))
 _SEVERITY_RANK = {"info": 0, "warning": 1, "critical": 2}
 # Max parallel troubleshoot threads (each uses one LLM slot — keep low to avoid GPU OOM)
@@ -56,6 +81,173 @@ logger = logging.getLogger(__name__)
 
 def _is_test_runtime() -> bool:
     return "pytest" in sys.modules or bool(os.getenv("PYTEST_CURRENT_TEST"))
+
+
+def _incident_metadata(row: dict[str, Any] | None) -> dict[str, Any]:
+    metadata = (row or {}).get("metadata") or {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _linked_admin_down_summary(metadata: dict[str, Any]) -> str:
+    root_host = metadata.get("root_host") or "the linked peer"
+    root_interface = metadata.get("root_interface") or "the linked interface"
+    remote_host = metadata.get("remote_host") or "the impacted device"
+    remote_interface = metadata.get("remote_interface") or "the impacted interface"
+    return (
+        f"Remote impact on {remote_host} {remote_interface} correlates with an admin shutdown on "
+        f"{root_host} {root_interface}. Confirm whether that shutdown was intentional before generating a "
+        "config remediation."
+    )
+
+
+def _linked_admin_down_cause(metadata: dict[str, Any]) -> str:
+    root_host = metadata.get("root_host") or "the linked peer"
+    root_interface = metadata.get("root_interface") or "the linked interface"
+    return (
+        f"The leading hypothesis is peer-induced impact from an operator-triggered shutdown on "
+        f"{root_host} {root_interface}, not an independent physical failure on the remote side."
+    )
+
+
+def _needs_intent_confirmation(row: dict[str, Any] | None) -> bool:
+    metadata = _incident_metadata(row)
+    return _incident_workflow_phase(row) == "intent_confirmation_required" or metadata.get("intent_status") == "needs_confirmation"
+
+
+def _incident_workflow_phase(row: dict[str, Any] | None) -> str:
+    phase = (row or {}).get("workflow_phase")
+    return phase if isinstance(phase, str) and phase else "none"
+
+
+def _fault_workflow_phase(row: dict[str, Any] | None) -> str:
+    phase = _incident_workflow_phase(row)
+    return phase if phase in _FAULT_PRESERVED_WORKFLOW_PHASES else "none"
+
+
+def _proposal_workflow_phase(proposal_status: str | None) -> str:
+    if proposal_status == "approved":
+        return "approved_to_execute"
+    if proposal_status == "pending":
+        return "remediation_available"
+    if proposal_status == "executed":
+        return "awaiting_verification"
+    return "none"
+
+
+def _incident_role(row: dict[str, Any] | None) -> str:
+    role = (row or {}).get("incident_role")
+    return role if isinstance(role, str) and role else _ROOT_INCIDENT_ROLE
+
+
+def _root_incident_id(row: dict[str, Any] | None) -> int | None:
+    value = (row or {}).get("root_incident_id")
+    return int(value) if isinstance(value, int) else None
+
+
+def _is_root_incident(row: dict[str, Any] | None) -> bool:
+    return _incident_role(row) == _ROOT_INCIDENT_ROLE
+
+
+def _relation_group_key_from_metadata(metadata: dict[str, Any] | None) -> str | None:
+    data = metadata or {}
+    link_id = str(data.get("link_id") or "").strip()
+    confidence = str(data.get("topology_confidence") or "").strip().lower()
+    if link_id and confidence == "high":
+        return f"{_RELATED_INCIDENT_PREFIX}{link_id}"
+    return None
+
+
+def _is_deprecated_root(row: dict[str, Any] | None) -> bool:
+    metadata = _incident_metadata(row)
+    return bool(metadata.get("deprecated_root"))
+
+
+def _incident_remediation_owner_id(row: dict[str, Any] | None) -> int | None:
+    value = (row or {}).get("remediation_owner_incident_id")
+    return int(value) if isinstance(value, int) else None
+
+
+def _incident_owns_remediation(row: dict[str, Any] | None) -> bool:
+    if row is None or not isinstance(row.get("id"), int):
+        return False
+    owner_id = _incident_remediation_owner_id(row)
+    return owner_id is None or owner_id == row["id"]
+
+
+def _verification_signal_state(output: str | None) -> str:
+    text = (output or "").lower()
+    if not text.strip():
+        return "unknown"
+    positive_markers = (
+        "is up, line protocol is up",
+        "changed state to up",
+        "from loading to full",
+        "from init to full",
+        "from exchange to full",
+        "neighbor state is full",
+        "protocol is up",
+    )
+    negative_markers = (
+        "administratively down",
+        "is down, line protocol is down",
+        "line protocol is down",
+        "dead timer expired",
+        "from full to down",
+        "changed state to down",
+        "protocol is down",
+    )
+    if any(marker in text for marker in positive_markers):
+        return "positive"
+    if any(marker in text for marker in negative_markers):
+        return "negative"
+    return "unknown"
+
+
+def _parse_link_id(link_id: str | None) -> list[tuple[str, str]]:
+    raw = (link_id or "").strip()
+    if not raw or "<->" not in raw:
+        return []
+    endpoints: list[tuple[str, str]] = []
+    for endpoint in raw.split("<->"):
+        host, _, interface_name = endpoint.partition(":")
+        host = host.strip()
+        interface_name = interface_name.strip()
+        if host and interface_name:
+            endpoints.append((host, interface_name))
+    return endpoints
+
+
+def _topology_path_label(metadata: dict[str, Any]) -> str:
+    endpoints = _parse_link_id(metadata.get("link_id"))
+    if len(endpoints) == 2:
+        return f"{endpoints[0][0]} {endpoints[0][1]} and {endpoints[1][0]} {endpoints[1][1]}"
+    root_side = [metadata.get("root_host"), metadata.get("root_interface")]
+    remote_side = [metadata.get("remote_host"), metadata.get("remote_interface")]
+    root_label = " ".join(part for part in root_side if part).strip()
+    remote_label = " ".join(part for part in remote_side if part).strip()
+    if root_label and remote_label:
+        return f"{root_label} and {remote_label}"
+    return root_label or remote_label or "the linked path"
+
+
+def _generic_topology_summary(metadata: dict[str, Any], *, dominant_family: str, dominant_host: str, active_child_count: int) -> str:
+    family_label = dominant_family.replace("_", " ").upper() if dominant_family else "NETWORK"
+    path_label = _topology_path_label(metadata)
+    impacted_host = dominant_host or "the linked device"
+    sibling_text = "symptom" if active_child_count == 1 else "symptoms"
+    return (
+        f"{family_label} impact is being tracked on the linked path between {path_label}. "
+        f"{impacted_host} is the current dominant symptom source, with {max(active_child_count, 1)} active {sibling_text} still attached to this root cause thread."
+    )
+
+
+def _generic_topology_cause(metadata: dict[str, Any], *, dominant_family: str) -> str:
+    path_label = _topology_path_label(metadata)
+    family_label = dominant_family.replace("_", " ").upper() if dominant_family else "network"
+    return (
+        f"Multiple {family_label} signals on {path_label} are being correlated as one shared link problem "
+        "until all related symptoms recover."
+    )
 
 
 class AIOpsService:
@@ -133,6 +325,13 @@ class AIOpsService:
             incident_no TEXT UNIQUE,
             title TEXT NOT NULL,
             status TEXT NOT NULL,
+            workflow_phase TEXT NOT NULL DEFAULT 'none',
+            incident_role TEXT NOT NULL DEFAULT 'root',
+            parent_incident_id BIGINT REFERENCES incidents(id) ON DELETE SET NULL,
+            root_incident_id BIGINT REFERENCES incidents(id) ON DELETE SET NULL,
+            suppressed_in_list BOOLEAN NOT NULL DEFAULT FALSE,
+            relation_group_key TEXT,
+            remediation_owner_incident_id BIGINT REFERENCES incidents(id) ON DELETE SET NULL,
             severity TEXT NOT NULL,
             category TEXT NOT NULL DEFAULT 'unknown',
             summary TEXT NOT NULL DEFAULT '',
@@ -146,6 +345,7 @@ class AIOpsService:
             event_count INTEGER NOT NULL DEFAULT 0,
             current_recovery_state TEXT NOT NULL DEFAULT 'none',
             resolution_type TEXT,
+            metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
             opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             resolved_at TIMESTAMPTZ,
@@ -369,6 +569,14 @@ class AIOpsService:
                     ("raw_logs",         "parse_status",                "TEXT NOT NULL DEFAULT 'ingested'"),
                     ("events",           "parser_name",                 "TEXT NOT NULL DEFAULT 'heuristic_v1'"),
                     ("events",           "parser_confidence",           "DOUBLE PRECISION NOT NULL DEFAULT 0.6"),
+                    ("incidents",        "metadata",                    "JSONB NOT NULL DEFAULT '{}'::jsonb"),
+                    ("incidents",        "workflow_phase",              "TEXT NOT NULL DEFAULT 'none'"),
+                    ("incidents",        "incident_role",               "TEXT NOT NULL DEFAULT 'root'"),
+                    ("incidents",        "parent_incident_id",          "BIGINT REFERENCES incidents(id) ON DELETE SET NULL"),
+                    ("incidents",        "root_incident_id",            "BIGINT REFERENCES incidents(id) ON DELETE SET NULL"),
+                    ("incidents",        "suppressed_in_list",          "BOOLEAN NOT NULL DEFAULT FALSE"),
+                    ("incidents",        "relation_group_key",          "TEXT"),
+                    ("incidents",        "remediation_owner_incident_id", "BIGINT REFERENCES incidents(id) ON DELETE SET NULL"),
                     ("candidate_groups", "decision_status",             "TEXT NOT NULL DEFAULT 'idle'"),
                     ("candidate_groups", "decision_requested_at",       "TIMESTAMPTZ"),
                     ("candidate_groups", "decision_attempts",           "INTEGER NOT NULL DEFAULT 0"),
@@ -392,6 +600,82 @@ class AIOpsService:
                 for table, col, col_def in _col_migrations:
                     if (table, col) not in existing_cols:
                         cur.execute(f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {col_def}')
+                cur.execute(
+                    """
+                    UPDATE incidents
+                    SET
+                        workflow_phase = CASE
+                            WHEN status = 'awaiting_approval' THEN 'remediation_available'
+                            WHEN status = 'approved' THEN 'approved_to_execute'
+                            WHEN status IN ('executing', 'verifying') THEN 'awaiting_verification'
+                            WHEN status = 'escalated' THEN
+                                CASE
+                                    WHEN COALESCE(resolution_type, '') = 'physical_handoff' THEN 'escalated_physical'
+                                    ELSE 'escalated_external'
+                                END
+                            WHEN COALESCE(metadata->>'cause_hint', '') = 'linked_admin_down'
+                                 AND COALESCE(metadata->>'intent_status', '') = 'needs_confirmation'
+                                THEN 'intent_confirmation_required'
+                            ELSE COALESCE(NULLIF(workflow_phase, ''), 'none')
+                        END,
+                        status = CASE
+                            WHEN status IN ('resolved', 'closed') THEN 'resolved'
+                            WHEN status = 'monitoring' THEN 'monitoring'
+                            WHEN status = 'recovering' THEN 'recovering'
+                            ELSE 'active'
+                        END
+                    WHERE status NOT IN ('active', 'recovering', 'monitoring', 'resolved')
+                       OR COALESCE(workflow_phase, '') = ''
+                       OR (
+                           COALESCE(workflow_phase, 'none') = 'none'
+                           AND COALESCE(metadata->>'cause_hint', '') = 'linked_admin_down'
+                           AND COALESCE(metadata->>'intent_status', '') = 'needs_confirmation'
+                       )
+                    """
+                )
+                cur.execute(
+                    """
+                    UPDATE incidents i
+                    SET workflow_phase = CASE
+                        WHEN p.status = 'approved' THEN 'approved_to_execute'
+                        WHEN p.status = 'pending' THEN 'remediation_available'
+                        WHEN p.status = 'executed' THEN 'awaiting_verification'
+                        ELSE i.workflow_phase
+                    END
+                    FROM proposals p
+                    WHERE p.id = i.current_proposal_id
+                      AND i.status IN ('active', 'recovering', 'monitoring')
+                      AND COALESCE(i.workflow_phase, 'none') = 'none'
+                    """
+                )
+                cur.execute(
+                    """
+                    UPDATE incidents
+                    SET workflow_phase = 'none'
+                    WHERE status = 'resolved'
+                      AND COALESCE(workflow_phase, 'none') <> 'none'
+                    """
+                )
+                cur.execute(
+                    """
+                    UPDATE incidents
+                    SET incident_role = COALESCE(NULLIF(incident_role, ''), 'root'),
+                        suppressed_in_list = COALESCE(suppressed_in_list, FALSE)
+                    WHERE COALESCE(incident_role, '') = ''
+                       OR suppressed_in_list IS NULL
+                    """
+                )
+                cur.execute(
+                    """
+                    UPDATE incidents
+                    SET root_incident_id = id
+                    WHERE incident_role = 'root'
+                      AND root_incident_id IS NULL
+                    """
+                )
+                cur.execute("CREATE INDEX IF NOT EXISTS incidents_relation_group_key_idx ON incidents (relation_group_key)")
+                cur.execute("CREATE INDEX IF NOT EXISTS incidents_remediation_owner_idx ON incidents (remediation_owner_incident_id)")
+                self._flatten_synthetic_roots(cur)
             conn.commit()
 
     def sync_inventory(self) -> None:
@@ -502,6 +786,1041 @@ class AIOpsService:
             (incident_id, kind, title, body, Json(payload or {})),
         )
 
+    def _enrich_parsed_event_metadata(
+        self,
+        *,
+        parsed: dict[str, Any],
+        device: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if device is None:
+            return parsed
+
+        metadata = dict(parsed.get("metadata") or {})
+        metadata["device_hostname"] = device.get("hostname", "")
+        metadata["device_mgmt_ip"] = device.get("ip_address", "")
+
+        interface_name = metadata.get("interface")
+        peer_ip = metadata.get("peer_ip")
+        topology = resolve_link_context(
+            device.get("hostname", ""),
+            interface_name if isinstance(interface_name, str) else None,
+            peer_ip=peer_ip if isinstance(peer_ip, str) else None,
+        )
+        if topology.get("link_id"):
+            metadata.update({
+                "link_id": topology["link_id"],
+                "local_interface": topology.get("local_interface", ""),
+                "remote_hostname": topology.get("remote_hostname", ""),
+                "remote_interface": topology.get("remote_interface", ""),
+                "remote_mgmt_ip": topology.get("remote_mgmt_ip", ""),
+                "topology_confidence": topology.get("topology_confidence", ""),
+                "topology_resolution_method": topology.get("resolution_method", ""),
+            })
+            if topology.get("local_interface"):
+                metadata["interface"] = topology["local_interface"]
+                if parsed.get("event_family") == "interface":
+                    key_parts = [parsed["source_ip"], parsed["event_family"], topology["local_interface"].lower()]
+                    if metadata.get("neighbor_ip"):
+                        key_parts.append(str(metadata["neighbor_ip"]))
+                    parsed["correlation_key"] = "|".join(key_parts)
+
+        parsed["metadata"] = metadata
+        return parsed
+
+    def _link_group_events_to_incident(self, cur: psycopg.Cursor[Any], *, incident_id: int, group_id: int) -> None:
+        cur.execute(
+            """
+            INSERT INTO incident_events (incident_id, event_id)
+            SELECT %s, cge.event_id
+            FROM candidate_group_events cge
+            WHERE cge.candidate_group_id = %s
+            ON CONFLICT (incident_id, event_id) DO NOTHING
+            """,
+            (incident_id, group_id),
+        )
+
+    def _link_event_to_incident(self, cur: psycopg.Cursor[Any], *, incident_id: int, event_id: int) -> None:
+        cur.execute(
+            """
+            INSERT INTO incident_events (incident_id, event_id)
+            VALUES (%s, %s)
+            ON CONFLICT (incident_id, event_id) DO NOTHING
+            """,
+            (incident_id, event_id),
+        )
+
+    def _update_incident_event_count(self, cur: psycopg.Cursor[Any], *, incident_id: int) -> None:
+        cur.execute("SELECT COUNT(*) AS count FROM incident_events WHERE incident_id = %s", (incident_id,))
+        count = cur.fetchone()["count"]
+        cur.execute(
+            """
+            UPDATE incidents
+            SET event_count = %s,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (count, incident_id),
+        )
+
+    def _should_use_topology_root(self, event: dict[str, Any]) -> bool:
+        metadata = event.get("metadata") or {}
+        return (
+            event.get("event_family") in _TOPOLOGY_ROOT_EVENT_FAMILIES
+            and event.get("event_state") not in _RECOVERY_EVENT_STATES
+            and event.get("event_state") != "admin_down"
+            and bool(metadata.get("link_id"))
+            and str(metadata.get("topology_confidence") or "").strip().lower() == "high"
+        )
+
+    def _find_open_topology_root(self, cur: psycopg.Cursor[Any], *, link_id: str) -> dict[str, Any] | None:
+        cur.execute(
+            """
+            SELECT *
+            FROM incidents
+            WHERE incident_role = %s
+              AND COALESCE(root_incident_id, id) = id
+              AND COALESCE(metadata->>'link_id', '') = %s
+              AND status = ANY(%s)
+            ORDER BY last_seen_at DESC
+            LIMIT 1
+            """,
+            (_ROOT_INCIDENT_ROLE, link_id, list(_OPEN_INCIDENT_STATUSES)),
+        )
+        return cur.fetchone()
+
+    def _upsert_symptom_incident(
+        self,
+        cur: psycopg.Cursor[Any],
+        *,
+        title: str,
+        severity: str,
+        category: str,
+        summary: str,
+        probable_cause: str,
+        primary_source_ip: str,
+        correlation_key: str,
+        event_family: str,
+        current_recovery_state: str,
+        metadata: dict[str, Any],
+        device: dict[str, Any] | None,
+        reopened: bool,
+        workflow_phase: str = "none",
+        relation_group_key: str | None = None,
+        remediation_owner_incident_id: int | None = None,
+    ) -> dict[str, Any]:
+        cur.execute(
+            """
+            SELECT *
+            FROM incidents
+            WHERE correlation_key = %s
+              AND COALESCE(suppressed_in_list, FALSE) = FALSE
+              AND COALESCE(metadata->>'deprecated_root', 'false') <> 'true'
+              AND status = ANY(%s)
+            ORDER BY opened_at DESC
+            LIMIT 1
+            """,
+            (correlation_key, list(_OPEN_INCIDENT_STATUSES)),
+        )
+        existing = cur.fetchone()
+        next_status = "recovering" if current_recovery_state == "signal_detected" else "active"
+        if existing:
+            cur.execute(
+                """
+                UPDATE incidents
+                SET title = %s,
+                    status = %s,
+                    severity = %s,
+                    category = %s,
+                    summary = %s,
+                    probable_cause = %s,
+                    primary_device_id = COALESCE(%s, primary_device_id),
+                    primary_source_ip = %s,
+                    event_family = %s,
+                    relation_group_key = COALESCE(%s, relation_group_key),
+                    remediation_owner_incident_id = COALESCE(%s, remediation_owner_incident_id),
+                    current_recovery_state = %s,
+                    workflow_phase = %s,
+                    metadata = %s::jsonb,
+                    resolution_type = CASE WHEN %s THEN NULL ELSE resolution_type END,
+                    resolved_at = CASE WHEN %s THEN NULL ELSE resolved_at END,
+                    reopened_count = CASE WHEN %s THEN reopened_count + 1 ELSE reopened_count END,
+                    last_seen_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (
+                    title,
+                    next_status,
+                    severity,
+                    category,
+                    summary,
+                    probable_cause,
+                    device["id"] if device else None,
+                    primary_source_ip,
+                    event_family,
+                    relation_group_key,
+                    remediation_owner_incident_id,
+                    current_recovery_state,
+                    workflow_phase,
+                    Json(metadata),
+                    reopened,
+                    reopened,
+                    reopened,
+                    existing["id"],
+                ),
+            )
+            return cur.fetchone()
+
+        cur.execute(
+            """
+            INSERT INTO incidents (
+                title, status, workflow_phase, incident_role, parent_incident_id, root_incident_id, suppressed_in_list,
+                relation_group_key, remediation_owner_incident_id,
+                severity, category, summary, probable_cause, confidence_score, site,
+                primary_device_id, primary_source_ip, correlation_key, event_family,
+                current_recovery_state, metadata, opened_at, last_seen_at
+            )
+            VALUES (%s, %s, %s, %s, NULL, NULL, FALSE, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s::jsonb, NOW(), NOW())
+            RETURNING *
+            """,
+            (
+                title,
+                next_status,
+                workflow_phase,
+                _ROOT_INCIDENT_ROLE,
+                relation_group_key,
+                remediation_owner_incident_id,
+                severity,
+                category,
+                summary,
+                probable_cause,
+                device["site"] if device else "",
+                device["id"] if device else None,
+                primary_source_ip,
+                correlation_key,
+                event_family,
+                current_recovery_state,
+                Json(metadata),
+            ),
+        )
+        symptom = cur.fetchone()
+        symptom["incident_no"] = self._next_incident_no(cur, symptom["id"])
+        cur.execute(
+            "UPDATE incidents SET root_incident_id = id, remediation_owner_incident_id = COALESCE(remediation_owner_incident_id, %s) WHERE id = %s",
+            (remediation_owner_incident_id or symptom["id"], symptom["id"]),
+        )
+        symptom["root_incident_id"] = symptom["id"]
+        symptom["remediation_owner_incident_id"] = remediation_owner_incident_id or symptom["id"]
+        return symptom
+
+    def _build_root_title(self, metadata: dict[str, Any], *, dominant_family: str, dominant_host: str) -> str:
+        family_label = dominant_family.replace("_", " ").title() if dominant_family else "Linked Path"
+        if metadata.get("cause_hint") == "linked_admin_down":
+            return f"{family_label} impact on {dominant_host or 'the remote peer'} linked to peer admin shutdown"
+        return f"{family_label} impact on {dominant_host or 'the linked path'} across correlated link path"
+
+    def _ensure_topology_root(
+        self,
+        cur: psycopg.Cursor[Any],
+        *,
+        link_id: str,
+        metadata: dict[str, Any],
+        dominant_family: str,
+        dominant_host: str,
+        severity: str,
+        category: str,
+        primary_source_ip: str,
+        device: dict[str, Any] | None,
+        workflow_phase: str,
+        cause_hint: str | None = None,
+    ) -> dict[str, Any]:
+        root = self._find_open_topology_root(cur, link_id=link_id)
+        root_metadata = {
+            **_incident_metadata(root),
+            **metadata,
+            "link_id": link_id,
+            "topology_confidence": metadata.get("topology_confidence") or "",
+        }
+        endpoints = _parse_link_id(link_id)
+        if len(endpoints) == 2:
+            root_metadata.setdefault("endpoint_a_host", endpoints[0][0])
+            root_metadata.setdefault("endpoint_a_interface", endpoints[0][1])
+            root_metadata.setdefault("endpoint_b_host", endpoints[1][0])
+            root_metadata.setdefault("endpoint_b_interface", endpoints[1][1])
+        if cause_hint:
+            root_metadata["cause_hint"] = cause_hint
+
+        title = self._build_root_title(root_metadata, dominant_family=dominant_family, dominant_host=dominant_host)
+        summary = _linked_admin_down_summary(root_metadata) if cause_hint == "linked_admin_down" else _generic_topology_summary(
+            root_metadata,
+            dominant_family=dominant_family,
+            dominant_host=dominant_host,
+            active_child_count=1,
+        )
+        probable_cause = _linked_admin_down_cause(root_metadata) if cause_hint == "linked_admin_down" else _generic_topology_cause(
+            root_metadata,
+            dominant_family=dominant_family,
+        )
+
+        if root:
+            next_workflow = workflow_phase or _incident_workflow_phase(root)
+            cur.execute(
+                """
+                UPDATE incidents
+                SET title = %s,
+                    status = CASE WHEN status = 'resolved' THEN 'active' ELSE status END,
+                    workflow_phase = %s,
+                    severity = %s,
+                    category = %s,
+                    summary = %s,
+                    probable_cause = %s,
+                    primary_device_id = COALESCE(%s, primary_device_id),
+                    primary_source_ip = %s,
+                    event_family = %s,
+                    metadata = %s::jsonb,
+                    suppressed_in_list = FALSE,
+                    last_seen_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (
+                    title,
+                    next_workflow,
+                    severity,
+                    category,
+                    summary,
+                    probable_cause,
+                    device["id"] if device else None,
+                    primary_source_ip,
+                    dominant_family or root["event_family"],
+                    Json(root_metadata),
+                    root["id"],
+                ),
+            )
+            return cur.fetchone()
+
+        cur.execute(
+            """
+            INSERT INTO incidents (
+                title, status, workflow_phase, incident_role, parent_incident_id, root_incident_id, suppressed_in_list,
+                severity, category, summary, probable_cause, confidence_score, site,
+                primary_device_id, primary_source_ip, correlation_key, event_family,
+                current_recovery_state, metadata, opened_at, last_seen_at
+            )
+            VALUES (%s, 'active', %s, %s, NULL, NULL, FALSE, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'watching', %s::jsonb, NOW(), NOW())
+            RETURNING *
+            """,
+            (
+                title,
+                workflow_phase,
+                _ROOT_INCIDENT_ROLE,
+                severity,
+                category,
+                summary,
+                probable_cause,
+                0.88 if cause_hint == "linked_admin_down" else 0.72,
+                device["site"] if device else "",
+                device["id"] if device else None,
+                primary_source_ip,
+                f"topology|{link_id}",
+                dominant_family or "topology",
+                Json(root_metadata),
+            ),
+        )
+        root = cur.fetchone()
+        root["incident_no"] = self._next_incident_no(cur, root["id"])
+        cur.execute("UPDATE incidents SET root_incident_id = id WHERE id = %s", (root["id"],))
+        root["root_incident_id"] = root["id"]
+        return root
+
+    def _sync_root_incident(self, cur: psycopg.Cursor[Any], *, root_id: int) -> None:
+        cur.execute(
+            """
+            SELECT *
+            FROM incidents
+            WHERE id = %s
+              AND incident_role = %s
+            """,
+            (root_id, _ROOT_INCIDENT_ROLE),
+        )
+        root = cur.fetchone()
+        if root is None:
+            return
+
+        cur.execute(
+            """
+            SELECT i.*, d.hostname AS primary_hostname, d.ip_address AS primary_ip
+            FROM incidents i
+            LEFT JOIN devices d ON d.id = i.primary_device_id
+            WHERE i.root_incident_id = %s
+              AND i.incident_role = %s
+            ORDER BY
+                CASE i.status
+                    WHEN 'active' THEN 0
+                    WHEN 'recovering' THEN 1
+                    WHEN 'monitoring' THEN 2
+                    ELSE 3
+                END,
+                CASE i.severity
+                    WHEN 'critical' THEN 0
+                    WHEN 'warning' THEN 1
+                    ELSE 2
+                END,
+                i.last_seen_at DESC
+            """,
+            (root_id, _SYMPTOM_INCIDENT_ROLE),
+        )
+        children = cur.fetchall()
+        if not children:
+            return
+
+        open_children = [child for child in children if child["status"] in _OPEN_INCIDENT_STATUSES]
+        active_children = [child for child in open_children if child["status"] == "active"]
+        recovering_children = [child for child in open_children if child["status"] == "recovering"]
+        monitoring_children = [child for child in open_children if child["status"] == "monitoring"]
+        dominant_child = open_children[0] if open_children else children[0]
+        latest_seen = max((child["last_seen_at"] for child in children if child.get("last_seen_at")), default=root["last_seen_at"])
+
+        next_status = "active"
+        next_recovery_state = "watching"
+        workflow_phase = _incident_workflow_phase(root)
+        resolution_type = root.get("resolution_type")
+        resolved_at: datetime | None = None
+
+        if not open_children and root["status"] == "resolved":
+            next_status = "resolved"
+            next_recovery_state = root.get("current_recovery_state") or "recovered"
+            workflow_phase = "none"
+            resolved_at = root.get("resolved_at")
+        elif active_children:
+            next_status = "active"
+            next_recovery_state = "watching"
+        elif recovering_children:
+            next_status = "recovering"
+            next_recovery_state = "signal_detected"
+        elif monitoring_children:
+            next_status = "monitoring"
+            next_recovery_state = "monitoring"
+        else:
+            next_status = "monitoring"
+            next_recovery_state = "monitoring"
+            stability_cutoff = datetime.now(timezone.utc) - timedelta(seconds=_RECOVERY_STABILITY_SECONDS)
+            if latest_seen and latest_seen <= stability_cutoff and workflow_phase in _TIME_BASED_AUTO_ADVANCE_WORKFLOW_PHASES:
+                next_status = "resolved"
+                next_recovery_state = "recovered"
+                workflow_phase = "none"
+                resolution_type = resolution_type or "auto_recovered"
+                resolved_at = datetime.now(timezone.utc)
+                cur.execute(
+                    """
+                    UPDATE proposals
+                    SET status = 'cancelled',
+                        cancelled_reason = 'incident_auto_resolved'
+                    WHERE incident_id = %s
+                      AND status IN ('pending', 'approved')
+                    """,
+                    (root_id,),
+                )
+
+        metadata = _incident_metadata(root)
+        title = self._build_root_title(
+            metadata,
+            dominant_family=dominant_child["event_family"],
+            dominant_host=dominant_child.get("primary_hostname") or dominant_child["primary_source_ip"],
+        )
+        summary = _linked_admin_down_summary(metadata) if metadata.get("cause_hint") == "linked_admin_down" else _generic_topology_summary(
+            metadata,
+            dominant_family=dominant_child["event_family"],
+            dominant_host=dominant_child.get("primary_hostname") or dominant_child["primary_source_ip"],
+            active_child_count=len(open_children),
+        )
+        probable_cause = _linked_admin_down_cause(metadata) if metadata.get("cause_hint") == "linked_admin_down" else _generic_topology_cause(
+            metadata,
+            dominant_family=dominant_child["event_family"],
+        )
+
+        cur.execute(
+            """
+            UPDATE incidents
+            SET title = %s,
+                status = %s,
+                workflow_phase = %s,
+                severity = %s,
+                category = %s,
+                summary = %s,
+                probable_cause = %s,
+                primary_device_id = COALESCE(%s, primary_device_id),
+                primary_source_ip = %s,
+                event_family = %s,
+                current_recovery_state = %s,
+                event_count = (
+                    SELECT COUNT(*)
+                    FROM incident_events ie
+                    WHERE ie.incident_id = %s
+                ),
+                resolution_type = %s,
+                current_proposal_id = CASE WHEN %s = 'resolved' THEN NULL ELSE current_proposal_id END,
+                last_seen_at = %s,
+                resolved_at = %s,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (
+                title,
+                next_status,
+                workflow_phase,
+                dominant_child["severity"],
+                "config-related" if metadata.get("cause_hint") == "linked_admin_down" else (dominant_child.get("category") or root["category"]),
+                summary,
+                probable_cause,
+                dominant_child.get("primary_device_id"),
+                dominant_child.get("primary_ip") or dominant_child["primary_source_ip"],
+                dominant_child["event_family"],
+                next_recovery_state,
+                root_id,
+                resolution_type if next_status == "resolved" else (None if next_status == "active" else resolution_type),
+                next_status,
+                latest_seen,
+                resolved_at,
+                root_id,
+            ),
+        )
+
+    def _sync_parent_roots_for_incident(self, cur: psycopg.Cursor[Any], *, incident_row: dict[str, Any] | None) -> None:
+        root_id = _root_incident_id(incident_row)
+        if root_id is None or _incident_role(incident_row) != _SYMPTOM_INCIDENT_ROLE:
+            return
+        self._sync_root_incident(cur, root_id=root_id)
+
+    def _sync_all_root_incidents(self, cur: psycopg.Cursor[Any]) -> int:
+        cur.execute(
+            """
+            SELECT DISTINCT i.id
+            FROM incidents i
+            WHERE i.incident_role = %s
+              AND EXISTS (
+                    SELECT 1
+                    FROM incidents child
+                    WHERE child.root_incident_id = i.id
+                      AND child.incident_role = %s
+                )
+            ORDER BY i.id
+            """,
+            (_ROOT_INCIDENT_ROLE, _SYMPTOM_INCIDENT_ROLE),
+        )
+        rows = cur.fetchall()
+        for row in rows:
+            self._sync_root_incident(cur, root_id=row["id"])
+        return len(rows)
+
+    def _attach_symptom_to_root(self, cur: psycopg.Cursor[Any], *, symptom_id: int, root_id: int) -> None:
+        cur.execute(
+            """
+            UPDATE incidents
+            SET incident_role = %s,
+                parent_incident_id = %s,
+                root_incident_id = %s,
+                suppressed_in_list = TRUE,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (_SYMPTOM_INCIDENT_ROLE, root_id, root_id, symptom_id),
+        )
+        cur.execute(
+            """
+            INSERT INTO incident_events (incident_id, event_id)
+            SELECT %s, ie.event_id
+            FROM incident_events ie
+            WHERE ie.incident_id = %s
+            ON CONFLICT (incident_id, event_id) DO NOTHING
+            """,
+            (root_id, symptom_id),
+        )
+        self._update_incident_event_count(cur, incident_id=symptom_id)
+        self._update_incident_event_count(cur, incident_id=root_id)
+
+    def _flatten_synthetic_roots(self, cur: psycopg.Cursor[Any]) -> int:
+        cur.execute(
+            """
+            SELECT *
+            FROM incidents
+            WHERE incident_role = %s
+              AND COALESCE(suppressed_in_list, FALSE) = FALSE
+              AND EXISTS (
+                    SELECT 1
+                    FROM incidents child
+                    WHERE child.root_incident_id = incidents.id
+                      AND child.incident_role = %s
+                )
+            ORDER BY id
+            """,
+            (_ROOT_INCIDENT_ROLE, _SYMPTOM_INCIDENT_ROLE),
+        )
+        roots = cur.fetchall()
+        flattened = 0
+        for root in roots:
+            cur.execute(
+                """
+                SELECT *
+                FROM incidents
+                WHERE root_incident_id = %s
+                  AND incident_role = %s
+                ORDER BY opened_at ASC, id ASC
+                """,
+                (root["id"], _SYMPTOM_INCIDENT_ROLE),
+            )
+            children = cur.fetchall()
+            if not children:
+                continue
+
+            root_metadata = _incident_metadata(root)
+            relation_group_key = (
+                root.get("relation_group_key")
+                or _relation_group_key_from_metadata(root_metadata)
+                or f"legacy-root|{root['id']}"
+            )
+            owner = next(
+                (
+                    child for child in children
+                    if str(_incident_metadata(child).get("operator_initiated_hint")).lower() == "true"
+                ),
+                None,
+            ) or children[0]
+            owner_id = owner["id"]
+
+            cur.execute(
+                """
+                UPDATE incidents
+                SET incident_role = %s,
+                    parent_incident_id = NULL,
+                    root_incident_id = id,
+                    suppressed_in_list = FALSE,
+                    relation_group_key = %s,
+                    remediation_owner_incident_id = %s,
+                    updated_at = NOW()
+                WHERE id = ANY(%s)
+                """,
+                (_ROOT_INCIDENT_ROLE, relation_group_key, owner_id, [child["id"] for child in children]),
+            )
+
+            cur.execute(
+                """
+                UPDATE proposals
+                SET incident_id = %s
+                WHERE incident_id = %s
+                """,
+                (owner_id, root["id"]),
+            )
+            cur.execute(
+                """
+                UPDATE executions
+                SET incident_id = %s
+                WHERE incident_id = %s
+                """,
+                (owner_id, root["id"]),
+            )
+            cur.execute(
+                """
+                UPDATE troubleshoot_runs
+                SET incident_id = %s
+                WHERE incident_id = %s
+                """,
+                (owner_id, root["id"]),
+            )
+            cur.execute(
+                """
+                UPDATE ai_summaries
+                SET incident_id = %s
+                WHERE incident_id = %s
+                """,
+                (owner_id, root["id"]),
+            )
+            cur.execute(
+                """
+                UPDATE incidents
+                SET current_proposal_id = COALESCE(current_proposal_id, %s),
+                    latest_ai_summary_id = COALESCE(latest_ai_summary_id, %s),
+                    summary = CASE WHEN COALESCE(summary, '') = '' THEN %s ELSE summary END,
+                    probable_cause = CASE WHEN COALESCE(probable_cause, '') = '' THEN %s ELSE probable_cause END,
+                    metadata = metadata || %s::jsonb,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (
+                    root.get("current_proposal_id"),
+                    root.get("latest_ai_summary_id"),
+                    root.get("summary") or "",
+                    root.get("probable_cause") or "",
+                    Json({
+                        "relation_group_key": relation_group_key,
+                        "flattened_from_root_incident": root.get("incident_no"),
+                    }),
+                    owner_id,
+                ),
+            )
+
+            deprecated_root_metadata = {
+                **root_metadata,
+                "deprecated_root": True,
+                "flattened_relation_group_key": relation_group_key,
+                "flattened_owner_incident_id": owner_id,
+            }
+            cur.execute(
+                """
+                UPDATE incidents
+                SET suppressed_in_list = TRUE,
+                    workflow_phase = 'none',
+                    current_proposal_id = NULL,
+                    metadata = %s::jsonb,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (Json(deprecated_root_metadata), root["id"]),
+            )
+            flattened += 1
+        return flattened
+
+    def _find_relation_owner_incident(
+        self,
+        cur: psycopg.Cursor[Any],
+        *,
+        relation_group_key: str | None,
+    ) -> dict[str, Any] | None:
+        if not relation_group_key:
+            return None
+        cur.execute(
+            """
+            SELECT *
+            FROM incidents
+            WHERE relation_group_key = %s
+              AND COALESCE(suppressed_in_list, FALSE) = FALSE
+              AND COALESCE(metadata->>'deprecated_root', 'false') <> 'true'
+              AND COALESCE(metadata->>'operator_initiated_hint', 'false') = 'true'
+              AND status <> 'resolved'
+            ORDER BY last_seen_at DESC
+            LIMIT 1
+            """,
+            (relation_group_key,),
+        )
+        return cur.fetchone()
+
+    def _find_recent_linked_admin_down(
+        self,
+        cur: psycopg.Cursor[Any],
+        *,
+        event: dict[str, Any],
+        raw_log: dict[str, Any],
+        device: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        metadata = event.get("metadata") or {}
+        link_id = str(metadata.get("link_id") or "").strip()
+        if (
+            device is None
+            or not link_id
+            or event.get("event_family") not in _LINKED_ADMIN_DOWN_EVENT_FAMILIES
+            or event.get("event_state") in _RECOVERY_EVENT_STATES
+            or event.get("event_state") == "admin_down"
+        ):
+            return None
+
+        cur.execute(
+            """
+            SELECT
+                e.*,
+                rl.id AS admin_raw_log_id,
+                rl.raw_message AS admin_raw_message,
+                cg.id AS admin_group_id,
+                d.hostname AS admin_hostname,
+                d.ip_address AS admin_source_ip,
+                e.title AS admin_title,
+                e.summary AS admin_summary,
+                e.severity AS admin_severity,
+                e.correlation_key AS admin_correlation_key,
+                e.event_family AS admin_event_family
+            FROM events e
+            JOIN raw_logs rl ON rl.id = e.raw_log_id
+            LEFT JOIN devices d ON d.id = e.device_id
+            LEFT JOIN candidate_group_events cge ON cge.event_id = e.id
+            LEFT JOIN candidate_groups cg ON cg.id = cge.candidate_group_id
+            WHERE e.event_state = 'admin_down'
+              AND e.metadata->>'link_id' = %s
+              AND COALESCE(e.metadata->>'operator_initiated_hint', 'false') = 'true'
+              AND rl.event_time >= %s - make_interval(secs => %s)
+              AND rl.event_time <= %s
+            ORDER BY e.created_at DESC
+            LIMIT 1
+            """,
+            (
+                link_id,
+                raw_log["event_time"],
+                _LINKED_ADMIN_DOWN_WINDOW_SECONDS,
+                raw_log["event_time"],
+            ),
+        )
+        admin_event = cur.fetchone()
+        if admin_event is None:
+            return None
+
+        admin_metadata = admin_event.get("metadata") or {}
+        return {
+            "admin_event_id": admin_event["id"],
+            "admin_raw_log_id": admin_event.get("admin_raw_log_id"),
+            "admin_raw_message": admin_event.get("admin_raw_message") or admin_event.get("summary") or "",
+            "admin_group_id": admin_event.get("admin_group_id"),
+            "admin_title": admin_event.get("admin_title") or "Administrative shutdown observed",
+            "admin_summary": admin_event.get("admin_summary") or admin_event.get("summary") or "",
+            "admin_severity": admin_event.get("admin_severity") or "info",
+            "admin_correlation_key": admin_event.get("admin_correlation_key") or "",
+            "admin_event_family": admin_event.get("admin_event_family") or "interface",
+            "admin_metadata": admin_metadata,
+            "admin_device_id": admin_event.get("device_id"),
+            "admin_source_ip": admin_event.get("admin_source_ip") or admin_metadata.get("device_mgmt_ip") or "",
+            "link_id": link_id,
+            "topology_confidence": metadata.get("topology_confidence")
+            or admin_metadata.get("topology_confidence")
+            or "high",
+            "root_host": admin_event.get("admin_hostname")
+            or admin_metadata.get("device_hostname")
+            or admin_metadata.get("root_host")
+            or "",
+            "root_interface": admin_metadata.get("interface")
+            or admin_metadata.get("local_interface")
+            or admin_metadata.get("root_interface")
+            or "",
+            "remote_host": metadata.get("device_hostname")
+            or device.get("hostname")
+            or metadata.get("remote_host")
+            or admin_metadata.get("remote_hostname")
+            or "",
+            "remote_interface": metadata.get("interface")
+            or metadata.get("local_interface")
+            or admin_metadata.get("remote_interface")
+            or "",
+        }
+
+    def _apply_linked_admin_down_correlation(
+        self,
+        cur: psycopg.Cursor[Any],
+        *,
+        event: dict[str, Any],
+        raw_log: dict[str, Any],
+        group: dict[str, Any],
+        device: dict[str, Any] | None,
+        admin_context: dict[str, Any],
+    ) -> int:
+        relation_group_key = (
+            _relation_group_key_from_metadata(event.get("metadata") or {})
+            or f"{_RELATED_INCIDENT_PREFIX}{admin_context['link_id']}"
+        )
+        existing_owner = self._find_relation_owner_incident(cur, relation_group_key=relation_group_key)
+        existing_owner_metadata = _incident_metadata(existing_owner)
+        intent_status = existing_owner_metadata.get("intent_status")
+        if intent_status not in {"confirmed_intentional", "confirmed_unintentional"}:
+            intent_status = "needs_confirmation"
+
+        owner_metadata = {
+            **existing_owner_metadata,
+            **(admin_context.get("admin_metadata") or {}),
+            "intent_status": intent_status,
+            "topology_confidence": admin_context.get("topology_confidence") or "",
+            "link_id": admin_context["link_id"],
+            "root_host": admin_context.get("root_host") or "",
+            "root_interface": admin_context.get("root_interface") or "",
+            "remote_host": admin_context.get("remote_host") or "",
+            "remote_interface": admin_context.get("remote_interface") or "",
+            "cause_hint": "linked_admin_down",
+            "operator_initiated_hint": True,
+        }
+        admin_device = self._find_device(
+            cur,
+            source_ip=admin_context.get("admin_source_ip") or owner_metadata.get("device_mgmt_ip") or "",
+            hostname=admin_context.get("root_host") or None,
+        )
+        admin_incident = self._upsert_symptom_incident(
+            cur,
+            title=admin_context.get("admin_title") or "Administrative shutdown observed",
+            severity=admin_context.get("admin_severity") or "info",
+            category="config-related",
+            summary=admin_context.get("admin_summary") or admin_context.get("admin_raw_message") or "Administrative shutdown observed on the linked interface.",
+            probable_cause=_linked_admin_down_cause(owner_metadata),
+            primary_source_ip=admin_context.get("admin_source_ip") or owner_metadata.get("root_mgmt_ip") or "",
+            correlation_key=admin_context.get("admin_correlation_key") or f"{admin_context['link_id']}|admin_down",
+            event_family=admin_context.get("admin_event_family") or "interface",
+            current_recovery_state="watching",
+            metadata=owner_metadata,
+            device=admin_device,
+            reopened=False,
+            workflow_phase="intent_confirmation_required" if intent_status == "needs_confirmation" else _incident_workflow_phase(existing_owner),
+            relation_group_key=relation_group_key,
+        )
+        cur.execute(
+            """
+            UPDATE incidents
+            SET remediation_owner_incident_id = %s,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (admin_incident["id"], admin_incident["id"]),
+        )
+        admin_incident["remediation_owner_incident_id"] = admin_incident["id"]
+
+        peer_metadata = {
+            **(event.get("metadata") or {}),
+            "link_id": admin_context["link_id"],
+            "topology_confidence": admin_context.get("topology_confidence") or "",
+            "root_host": admin_context.get("root_host") or "",
+            "root_interface": admin_context.get("root_interface") or "",
+            "remote_host": admin_context.get("remote_host") or "",
+            "remote_interface": admin_context.get("remote_interface") or "",
+            "cause_hint": "linked_admin_down",
+            "relation_reason": "peer_admin_shutdown",
+            "related_admin_incident_id": admin_incident["id"],
+            "related_admin_incident_no": admin_incident.get("incident_no"),
+        }
+        current_incident = self._upsert_symptom_incident(
+            cur,
+            title=event["title"],
+            severity=event["severity"],
+            category="config-related",
+            summary=event["summary"],
+            probable_cause=_linked_admin_down_cause(owner_metadata),
+            primary_source_ip=device["ip_address"] if device else raw_log["source_ip"],
+            correlation_key=event["correlation_key"],
+            event_family=event["event_family"],
+            current_recovery_state="watching",
+            metadata=peer_metadata,
+            device=device,
+            reopened=False,
+            relation_group_key=relation_group_key,
+            remediation_owner_incident_id=admin_incident["id"],
+        )
+
+        self._link_group_events_to_incident(cur, incident_id=current_incident["id"], group_id=group["id"])
+        self._link_event_to_incident(cur, incident_id=admin_incident["id"], event_id=admin_context["admin_event_id"])
+        self._update_incident_event_count(cur, incident_id=current_incident["id"])
+        self._update_incident_event_count(cur, incident_id=admin_incident["id"])
+
+        cur.execute(
+            """
+            UPDATE raw_logs
+            SET parse_status = 'llm_decided'
+            WHERE id IN (
+                SELECT rl.id
+                FROM raw_logs rl
+                JOIN events e ON e.raw_log_id = rl.id
+                JOIN candidate_group_events cge ON cge.event_id = e.id
+                WHERE cge.candidate_group_id = %s
+            )
+            """,
+            (group["id"],),
+        )
+        if admin_context.get("admin_raw_log_id") is not None:
+            cur.execute(
+                "UPDATE raw_logs SET parse_status = 'llm_decided' WHERE id = %s",
+                (admin_context["admin_raw_log_id"],),
+            )
+
+        cur.execute(
+            """
+            UPDATE candidate_groups
+            SET linked_incident_id = %s,
+                last_decision_at = NOW(),
+                last_decision_event_count = %s,
+                decision_status = 'idle',
+                decision_requested_at = NULL,
+                decision_locked_at = NULL,
+                status = 'open',
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (current_incident["id"], group["event_count"], group["id"]),
+        )
+        if admin_context.get("admin_group_id") is not None:
+            cur.execute(
+                """
+                UPDATE candidate_groups
+                SET linked_incident_id = %s,
+                    decision_status = 'idle',
+                    decision_requested_at = NULL,
+                    decision_locked_at = NULL,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (admin_incident["id"], admin_context["admin_group_id"]),
+            )
+
+        self._record_timeline(
+            cur,
+            current_incident["id"],
+            "decision",
+            "Related incident linked to peer admin shutdown",
+            _linked_admin_down_summary(owner_metadata),
+            {
+                "cause_hint": "linked_admin_down",
+                "link_id": admin_context["link_id"],
+                "root_host": owner_metadata.get("root_host"),
+                "root_interface": owner_metadata.get("root_interface"),
+                "remote_host": owner_metadata.get("remote_host"),
+                "remote_interface": owner_metadata.get("remote_interface"),
+                "remediation_owner_incident_id": admin_incident["id"],
+                "remediation_owner_incident_no": admin_incident.get("incident_no"),
+            },
+        )
+        self._record_timeline(
+            cur,
+            admin_incident["id"],
+            "event",
+            "Peer impact correlated",
+            event["summary"],
+            {
+                "event_id": event["id"],
+                "link_id": admin_context["link_id"],
+                "related_incident_id": current_incident["id"],
+                "related_incident_no": current_incident.get("incident_no"),
+            },
+        )
+        self._record_timeline(
+            cur,
+            admin_incident["id"],
+            "event",
+            "Administrative shutdown observed",
+            admin_context.get("admin_raw_message") or "Linked peer reported an administrative shutdown.",
+            {
+                "event_id": admin_context["admin_event_id"],
+                "link_id": admin_context["link_id"],
+                "event_state": "admin_down",
+            },
+        )
+        self._record_timeline(
+            cur,
+            current_incident["id"],
+            "event",
+            "Related admin-down incident",
+            (
+                f"Administrative shutdown on {owner_metadata.get('root_host') or 'peer'} "
+                f"{owner_metadata.get('root_interface') or 'interface'} is being tracked separately as "
+                f"{admin_incident.get('incident_no') or 'the owning incident'}."
+            ),
+            {
+                "related_incident_id": admin_incident["id"],
+                "related_incident_no": admin_incident.get("incident_no"),
+            },
+        )
+        self._record_timeline(
+            cur,
+            current_incident["id"],
+            "event",
+            event["title"],
+            event["summary"],
+            {
+                "event_id": event["id"],
+                "link_id": admin_context["link_id"],
+            },
+        )
+        return current_incident["id"]
+
     def enqueue_syslog(
         self,
         source_ip: str,
@@ -552,8 +1871,9 @@ class AIOpsService:
         parse_count = 0
         decision_count = 0
         try:
-            # Auto-resolve incidents that have been stable (no fault) past the window
-            self._auto_resolve_stable_incidents()
+            # Refresh recovery lifecycle so wall-clock-based transitions do not
+            # depend on a fresh syslog arriving.
+            self._refresh_time_based_incident_states()
             # Mark exhausted groups as idle so they stop consuming LLM cycles
             self._retire_exhausted_groups()
             while processed < limit and parse_count < max_parse:
@@ -570,9 +1890,140 @@ class AIOpsService:
         finally:
             self._pipeline_lock.release()
 
+    def _promote_recovering_system_incidents(self) -> int:
+        """Move boot-progressing system incidents from recovering to monitoring."""
+        settle_secs = int(os.getenv("AIOPS_SYSTEM_BOOT_MONITORING_SECONDS", str(_SYSTEM_BOOT_MONITORING_SECONDS)))
+        allowed_workflow_phases = list(_TIME_BASED_AUTO_ADVANCE_WORKFLOW_PHASES)
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE incidents
+                    SET status = 'monitoring',
+                        current_recovery_state = 'monitoring',
+                        updated_at = NOW()
+                    WHERE id IN (
+                        SELECT DISTINCT i.id
+                        FROM incidents i
+                        JOIN incident_events ie ON ie.incident_id = i.id
+                        JOIN events e ON e.id = ie.event_id
+                        LEFT JOIN raw_logs rl ON rl.id = e.raw_log_id
+                        WHERE i.status = 'recovering'
+                          AND COALESCE(i.suppressed_in_list, FALSE) = FALSE
+                          AND COALESCE(i.metadata->>'deprecated_root', 'false') <> 'true'
+                          AND COALESCE(i.workflow_phase, 'none') = ANY(%s)
+                          AND i.event_family = 'system'
+                          AND i.current_recovery_state = 'signal_detected'
+                          AND i.last_seen_at < NOW() - (interval '1 second' * %s)
+                          AND (
+                                UPPER(COALESCE(e.metadata->>'mnemonic', '')) IN (
+                                    'COLDSTART',
+                                    'LOGGINGHOST_STARTSTOP',
+                                    'SIGNATURE_VERIFIED'
+                                )
+                                OR COALESCE(rl.raw_message, '') ILIKE '%%code signing verification%%'
+                                OR COALESCE(rl.raw_message, '') ILIKE '%%logging to host%%started%%'
+                          )
+                    )
+                    RETURNING id, incident_no
+                    """,
+                    (allowed_workflow_phases, settle_secs),
+                )
+                promoted = cur.fetchall()
+                for row in promoted:
+                    self._record_timeline(
+                        cur,
+                        row["id"],
+                        "recovery",
+                        "Auto-advanced to monitoring",
+                        (
+                            "Observed boot-progress signals after the restart and no new failure "
+                            f"for {max(1, settle_secs // 60)} minute(s), so the incident moved to monitoring."
+                        ),
+                        {"boot_settle_seconds": settle_secs},
+                    )
+            conn.commit()
+        if promoted:
+            logger.info("Promoted %d recovering system incident(s) to monitoring", len(promoted))
+            for row in promoted:
+                try:
+                    self.refresh_incident_summary(row["id"])
+                except Exception as exc:
+                    logger.warning("AIOps summary refresh failed for promoted incident %s: %s", row["incident_no"], exc)
+        return len(promoted)
+
+    def _promote_recovering_signal_incidents(self) -> int:
+        """Move non-system recovery-signal incidents from recovering to monitoring."""
+        settle_secs = int(
+            os.getenv(
+                "AIOPS_RECOVERY_SIGNAL_MONITORING_SECONDS",
+                str(_RECOVERY_SIGNAL_MONITORING_SECONDS),
+            )
+        )
+        allowed_workflow_phases = list(_TIME_BASED_AUTO_ADVANCE_WORKFLOW_PHASES)
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE incidents
+                    SET status = 'monitoring',
+                        current_recovery_state = 'monitoring',
+                        updated_at = NOW()
+                    WHERE status = 'recovering'
+                      AND COALESCE(suppressed_in_list, FALSE) = FALSE
+                      AND COALESCE(metadata->>'deprecated_root', 'false') <> 'true'
+                      AND COALESCE(workflow_phase, 'none') = ANY(%s)
+                      AND event_family <> 'system'
+                      AND current_recovery_state = 'signal_detected'
+                      AND last_seen_at < NOW() - (interval '1 second' * %s)
+                    RETURNING id, incident_no
+                    """,
+                    (allowed_workflow_phases, settle_secs),
+                )
+                promoted = cur.fetchall()
+                for row in promoted:
+                    self._record_timeline(
+                        cur,
+                        row["id"],
+                        "recovery",
+                        "Auto-advanced to monitoring",
+                        (
+                            "Observed a recovery signal and no repeat failure "
+                            f"for {max(1, settle_secs // 60)} minute(s), so the incident moved to monitoring."
+                        ),
+                        {"recovery_settle_seconds": settle_secs},
+                    )
+            conn.commit()
+        if promoted:
+            logger.info("Promoted %d recovering signal incident(s) to monitoring", len(promoted))
+            for row in promoted:
+                try:
+                    self.refresh_incident_summary(row["id"])
+                except Exception as exc:
+                    logger.warning("AIOps summary refresh failed for promoted incident %s: %s", row["incident_no"], exc)
+        return len(promoted)
+
+    def _refresh_time_based_incident_states(self) -> dict[str, int]:
+        """Apply time-based lifecycle transitions before reads and pipeline work."""
+        promoted_system = self._promote_recovering_system_incidents()
+        promoted_signals = self._promote_recovering_signal_incidents()
+        resolved = self._auto_resolve_stable_incidents()
+        return {
+            "promoted_system": promoted_system,
+            "promoted_signals": promoted_signals,
+            "resolved": resolved,
+            "synced_roots": 0,
+        }
+
     def _auto_resolve_stable_incidents(self) -> int:
         """Auto-resolve incidents that have remained stable in monitoring."""
-        stability_secs = int(os.getenv("AIOPS_RECOVERY_STABILITY_SECONDS", "300"))  # 5 min default
+        stability_secs = int(
+            os.getenv(
+                "AIOPS_RECOVERY_STABILITY_SECONDS",
+                str(_RECOVERY_STABILITY_SECONDS),
+            )
+        )
+        allowed_workflow_phases = list(_TIME_BASED_AUTO_ADVANCE_WORKFLOW_PHASES)
         with connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -582,12 +2033,17 @@ class AIOpsService:
                         resolution_type = COALESCE(resolution_type, 'auto_recovered'),
                         resolved_at = NOW(),
                         current_recovery_state = 'recovered',
+                        workflow_phase = 'none',
+                        current_proposal_id = NULL,
                         updated_at = NOW()
                     WHERE status = 'monitoring'
+                      AND COALESCE(suppressed_in_list, FALSE) = FALSE
+                      AND COALESCE(metadata->>'deprecated_root', 'false') <> 'true'
+                      AND COALESCE(workflow_phase, 'none') = ANY(%s)
                       AND last_seen_at < NOW() - (interval '1 second' * %s)
                     RETURNING id, incident_no
                     """,
-                    (stability_secs,),
+                    (allowed_workflow_phases, stability_secs),
                 )
                 resolved = cur.fetchall()
                 if resolved:
@@ -615,6 +2071,11 @@ class AIOpsService:
             conn.commit()
         if resolved:
             logger.info("Auto-resolved %d incident(s) after stability window", len(resolved))
+            for row in resolved:
+                try:
+                    self.refresh_incident_summary(row["id"])
+                except Exception as exc:
+                    logger.warning("AIOps summary refresh failed for resolved incident %s: %s", row["incident_no"], exc)
         return len(resolved)
 
     def _retire_exhausted_groups(self) -> None:
@@ -710,6 +2171,7 @@ class AIOpsService:
         if job is None:
             return False
         try:
+            summary_refresh_incident_id: int | None = None
             with connect() as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT * FROM raw_logs WHERE id = %s", (job["raw_log_id"],))
@@ -739,7 +2201,7 @@ class AIOpsService:
                         event_time=raw_log["event_time"],
                     )
                     if parsed is None:
-                        # Noise / boot banner / admin-down — parser already decided to discard
+                        # Noise / boot banner — parser already decided to discard
                         cur.execute(
                             "UPDATE raw_logs SET parse_status = 'noise' WHERE id = %s",
                             (raw_log["id"],),
@@ -747,6 +2209,7 @@ class AIOpsService:
                         conn.commit()
                         self._complete_job(job["id"], status="completed")
                         return True
+                    parsed = self._enrich_parsed_event_metadata(parsed=parsed, device=device)
                     cur.execute(
                         """
                         INSERT INTO events (
@@ -798,16 +2261,40 @@ class AIOpsService:
                                 "event_family": event["event_family"],
                                 "event_state": event["event_state"],
                                 "correlation_key": event["correlation_key"],
+                                **({
+                                    "link_id": event["metadata"].get("link_id"),
+                                    "topology_confidence": event["metadata"].get("topology_confidence"),
+                                } if event["metadata"].get("link_id") else {}),
                             }),
                             raw_log["id"],
                         ),
+                    )
+                    admin_context = self._find_recent_linked_admin_down(
+                        cur,
+                        event=event,
+                        raw_log=raw_log,
+                        device=device,
                     )
                     # Tracking/IP SLA "down" events: merge into a related EIGRP/tunnel/interface
                     # incident if one occurred recently on the same device, to avoid a
                     # duplicate incident for what is effectively the same path failure.
                     # "up" events always use the normal recovery path so the tracking incident
                     # itself gets its own recovery signal (not just the EIGRP/tunnel incident).
-                    if event["event_family"] == "tracking" and event["event_state"] != "up":
+                    if not event["metadata"].get("eligible_for_standalone_incident", True):
+                        cur.execute(
+                            "UPDATE candidate_groups SET decision_status = 'idle', updated_at = NOW() WHERE id = %s",
+                            (group["id"],),
+                        )
+                    elif admin_context is not None:
+                        summary_refresh_incident_id = self._apply_linked_admin_down_correlation(
+                            cur,
+                            event=event,
+                            raw_log=raw_log,
+                            group=group,
+                            device=device,
+                            admin_context=admin_context,
+                        )
+                    elif event["event_family"] == "tracking" and event["event_state"] != "up":
                         merged = self._try_merge_tracking_into_related_incident(
                             cur, event=event, raw_log=raw_log, group=group
                         )
@@ -821,6 +2308,15 @@ class AIOpsService:
                     else:
                         self._mark_candidate_group_pending_decision(cur, group_id=group["id"])
                 conn.commit()
+            if summary_refresh_incident_id is not None:
+                try:
+                    self.refresh_incident_summary(summary_refresh_incident_id)
+                except Exception as summary_exc:
+                    logger.warning(
+                        "AIOps summary refresh failed for linked admin-down incident %s: %s",
+                        summary_refresh_incident_id,
+                        summary_exc,
+                    )
             self._complete_job(
                 job["id"],
                 status="completed",
@@ -843,9 +2339,11 @@ class AIOpsService:
         """Directly update a matching open incident on recovery — no LLM needed."""
         cur.execute(
             """
-            SELECT id, incident_no, status
+            SELECT *
             FROM incidents
             WHERE correlation_key = %s
+              AND COALESCE(suppressed_in_list, FALSE) = FALSE
+              AND COALESCE(metadata->>'deprecated_root', 'false') <> 'true'
               AND status = ANY(%s)
             ORDER BY last_seen_at DESC
             LIMIT 1
@@ -857,27 +2355,47 @@ class AIOpsService:
             # No matching open incident → let LLM decide
             self._mark_candidate_group_pending_decision(cur, group_id=group["id"])
             return
-        # Update incident to recovering and bump event count
+
+        next_resolution_type = "verified_recovery" if _incident_workflow_phase(incident) in {"approved_to_execute", "awaiting_verification"} else (incident.get("resolution_type") or "auto_recovered")
         cur.execute(
             """
             UPDATE incidents
-            SET status = 'recovering',
-                current_recovery_state = 'signal_detected',
-                event_count = event_count + 1,
+            SET status = 'resolved',
+                workflow_phase = 'none',
+                current_recovery_state = 'recovered',
+                resolution_type = %s,
+                current_proposal_id = NULL,
+                resolved_at = NOW(),
                 last_seen_at = NOW(),
                 updated_at = NOW()
             WHERE id = %s
+            RETURNING *
             """,
-            (incident["id"],),
+            (next_resolution_type, incident["id"]),
+        )
+        updated_incident = cur.fetchone()
+        self._link_group_events_to_incident(cur, incident_id=updated_incident["id"], group_id=group["id"])
+        self._update_incident_event_count(cur, incident_id=updated_incident["id"])
+        cur.execute(
+            """
+            UPDATE proposals
+            SET status = 'cancelled',
+                cancelled_reason = 'incident_auto_resolved'
+            WHERE incident_id = %s
+              AND status IN ('pending', 'approved')
+            """,
+            (updated_incident["id"],),
         )
         self._record_timeline(
             cur,
-            incident["id"],
+            updated_incident["id"],
             "recovery",
-            "Recovery signal detected",
-            f"Received {event['event_state']} event: {raw_log['raw_message'][:120]}",
-            {"event_id": event["id"], "event_state": event["event_state"]},
+            "Recovery signal resolved incident",
+            f"Received positive recovery evidence ({event['event_state']}): {raw_log['raw_message'][:120]}",
+            {"event_id": event["id"], "event_state": event["event_state"], "resolution_type": next_resolution_type},
         )
+        linked_incident_id = updated_incident["id"]
+
         # Link raw log to incident
         cur.execute(
             "UPDATE raw_logs SET parse_status = 'llm_decided' WHERE id = %s",
@@ -885,10 +2403,18 @@ class AIOpsService:
         )
         # Mark group idle — no LLM needed
         cur.execute(
-            "UPDATE candidate_groups SET decision_status = 'idle', updated_at = NOW() WHERE id = %s",
-            (group["id"],),
+            """
+            UPDATE candidate_groups
+            SET linked_incident_id = %s,
+                decision_status = 'idle',
+                decision_requested_at = NULL,
+                decision_locked_at = NULL,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (linked_incident_id, group["id"]),
         )
-        logger.info("Recovery signal applied to %s → recovering", incident["incident_no"])
+        logger.info("Recovery signal resolved %s", updated_incident["incident_no"])
 
     def _try_merge_tracking_into_related_incident(
         self,
@@ -1001,6 +2527,8 @@ class AIOpsService:
             SELECT id, incident_no, status, event_family, correlation_key
             FROM incidents
             WHERE primary_source_ip = %s
+              AND COALESCE(suppressed_in_list, FALSE) = FALSE
+              AND COALESCE(metadata->>'deprecated_root', 'false') <> 'true'
               AND event_family = ANY(%s)
               AND status = ANY(%s)
             ORDER BY opened_at DESC
@@ -1347,6 +2875,8 @@ class AIOpsService:
                         FROM incidents i
                         LEFT JOIN devices d ON d.id = i.primary_device_id
                         WHERE i.status = ANY(%s)
+                          AND COALESCE(i.suppressed_in_list, FALSE) = FALSE
+                          AND COALESCE(i.metadata->>'deprecated_root', 'false') <> 'true'
                         ORDER BY i.last_seen_at DESC
                         LIMIT 20
                         """,
@@ -1456,13 +2986,15 @@ class AIOpsService:
         with connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT incident_no, status, severity FROM incidents WHERE id = %s",
+                    "SELECT incident_no, status, workflow_phase, severity FROM incidents WHERE id = %s",
                     (incident_id,),
                 )
                 row = cur.fetchone()
         if row is None or row["incident_no"] is None:
             return
-        if row["status"] not in ("new", "active", "investigating"):
+        if row["status"] != "active":
+            return
+        if row.get("workflow_phase") in {"remediation_available", "approved_to_execute", "awaiting_verification"}:
             return
         with connect() as conn:
             with conn.cursor() as cur:
@@ -1519,6 +3051,8 @@ class AIOpsService:
                 SELECT id, incident_no, status
                 FROM incidents
                 WHERE correlation_key = %s
+                  AND COALESCE(suppressed_in_list, FALSE) = FALSE
+                  AND COALESCE(metadata->>'deprecated_root', 'false') <> 'true'
                   AND status = ANY(%s)
                 ORDER BY opened_at DESC
                 LIMIT 1
@@ -1526,6 +3060,129 @@ class AIOpsService:
                 (decision["correlation_key"], list(_OPEN_INCIDENT_STATUSES)),
             )
             incident = cur.fetchone()
+
+        relation_group_key = _relation_group_key_from_metadata({
+            **(latest_event.get("metadata") if latest_event else {}),
+            **(decision.get("metadata") or {}),
+        })
+        relation_owner = self._find_relation_owner_incident(cur, relation_group_key=relation_group_key)
+
+        if latest_event is not None and decision["action"] != "ignore" and self._should_use_topology_root(latest_event):
+            topology_metadata = {
+                **(latest_event.get("metadata") or {}),
+                **(decision.get("metadata") or {}),
+            }
+            link_id = str(topology_metadata.get("link_id") or "").strip()
+            if link_id:
+                relation_group_key = _relation_group_key_from_metadata(topology_metadata)
+                relation_owner = self._find_relation_owner_incident(cur, relation_group_key=relation_group_key)
+                related_incident = self._upsert_symptom_incident(
+                    cur,
+                    title=decision["title"],
+                    severity=decision["severity"],
+                    category=decision.get("category") or "unknown",
+                    summary=decision["summary"],
+                    probable_cause=decision.get("reasoning") or decision["summary"],
+                    primary_source_ip=device["ip_address"] if device else group["source_ip"],
+                    correlation_key=decision["correlation_key"],
+                    event_family=decision["event_family"],
+                    current_recovery_state="signal_detected" if decision["event_state"] in _RECOVERY_EVENT_STATES else "watching",
+                    metadata=topology_metadata,
+                    device=device,
+                    reopened=False,
+                    relation_group_key=relation_group_key,
+                    remediation_owner_incident_id=relation_owner["id"] if relation_owner else None,
+                )
+                self._link_group_events_to_incident(cur, incident_id=related_incident["id"], group_id=group["id"])
+                self._update_incident_event_count(cur, incident_id=related_incident["id"])
+                self._record_timeline(
+                    cur,
+                    related_incident["id"],
+                    "decision",
+                    "Topology relation detected",
+                    decision.get("reasoning", "A high-confidence link context was detected, so this incident was related to the other incidents on the same path."),
+                    {
+                        "action": decision["action"],
+                        "candidate_group_id": group["id"],
+                        "relation_group_key": relation_group_key,
+                        "remediation_owner_incident_id": relation_owner["id"] if relation_owner else None,
+                        "link_id": link_id,
+                    },
+                )
+                self._record_timeline(
+                    cur,
+                    related_incident["id"],
+                    "event",
+                    latest_event["title"],
+                    latest_event["summary"],
+                    {
+                        "event_state": latest_event["event_state"],
+                        "event_family": latest_event["event_family"],
+                    },
+                )
+                cur.execute(
+                    """
+                    INSERT INTO llm_incident_decisions (
+                        candidate_group_id, incident_id, action, incident_no, title, event_family,
+                        event_state, severity, summary, correlation_key, category, reasoning, metadata, raw_response
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        group["id"],
+                        related_incident["id"],
+                        decision["action"],
+                        related_incident.get("incident_no"),
+                        decision["title"],
+                        decision["event_family"],
+                        decision["event_state"],
+                        decision["severity"],
+                        decision["summary"],
+                        decision["correlation_key"],
+                        decision.get("category") or "unknown",
+                        decision.get("reasoning", ""),
+                        Json(topology_metadata),
+                        decision.get("raw_response", ""),
+                    ),
+                )
+                cur.execute(
+                    """
+                    UPDATE candidate_groups
+                    SET linked_incident_id = %s,
+                        last_decision_at = NOW(),
+                        last_decision_event_count = %s,
+                        decision_status = CASE
+                            WHEN event_count > %s THEN 'pending'
+                            ELSE 'idle'
+                        END,
+                        decision_requested_at = CASE
+                            WHEN event_count > %s THEN %s
+                            ELSE NULL
+                        END,
+                        decision_locked_at = NULL,
+                        status = 'open',
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (
+                        related_incident["id"],
+                        claimed_event_count,
+                        claimed_event_count,
+                        claimed_event_count,
+                        datetime.now(timezone.utc) + _GROUP_DECISION_DEBOUNCE,
+                        group["id"],
+                    ),
+                )
+                if raw_logs:
+                    cur.execute(
+                        """
+                        UPDATE raw_logs
+                        SET parse_status = %s
+                        WHERE id = ANY(%s)
+                        """,
+                        ("llm_decided", [row["id"] for row in raw_logs]),
+                    )
+                return related_incident["id"]
 
         incident_id: int | None = None
         if decision["action"] != "ignore":
@@ -1616,15 +3273,16 @@ class AIOpsService:
                 and decision["event_state"] not in _RECOVERY_EVENT_STATES
                 and incident["status"] in _POST_RECOVERY_STATUSES
             )
+            current_workflow_phase = _incident_workflow_phase(incident)
             if decision["event_state"] in _RECOVERY_EVENT_STATES:
                 next_status = "recovering"
+                next_workflow_phase = current_workflow_phase
             elif incident:
-                if incident["status"] in _REMEDIATION_HOLD_STATUSES:
-                    next_status = incident["status"]
-                else:
-                    next_status = "investigating"
+                next_status = "active"
+                next_workflow_phase = _fault_workflow_phase(incident)
             else:
-                next_status = "investigating"
+                next_status = "active"
+                next_workflow_phase = "none"
             recovery_state = "signal_detected" if decision["event_state"] in _RECOVERY_EVENT_STATES else "watching"
             if incident:
                 cur.execute(
@@ -1634,6 +3292,9 @@ class AIOpsService:
                         severity = %s,
                         category = COALESCE(%s, category),
                         status = %s,
+                        workflow_phase = %s,
+                        relation_group_key = COALESCE(%s, relation_group_key),
+                        remediation_owner_incident_id = COALESCE(%s, remediation_owner_incident_id),
                         current_recovery_state = %s,
                         event_count = %s,
                         site = %s,
@@ -1652,6 +3313,9 @@ class AIOpsService:
                         decision["severity"],
                         decision.get("category"),
                         next_status,
+                        next_workflow_phase,
+                        relation_group_key,
+                        relation_owner["id"] if relation_owner else None,
                         recovery_state,
                         group["event_count"],
                         device["site"] if device else "",
@@ -1668,15 +3332,17 @@ class AIOpsService:
                 cur.execute(
                     """
                     INSERT INTO incidents (
-                        title, status, severity, category, summary, primary_source_ip, correlation_key,
-                        event_family, event_count, site, primary_device_id, current_recovery_state, opened_at, last_seen_at
+                        title, status, workflow_phase, severity, category, summary, primary_source_ip, correlation_key,
+                        event_family, event_count, site, primary_device_id, current_recovery_state,
+                        relation_group_key, remediation_owner_incident_id, opened_at, last_seen_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
                     RETURNING *
                     """,
                     (
                         decision["title"],
                         next_status,
+                        next_workflow_phase,
                         decision["severity"],
                         decision.get("category") or "unknown",
                         decision["summary"],
@@ -1687,10 +3353,16 @@ class AIOpsService:
                         device["site"] if device else "",
                         device["id"] if device else None,
                         recovery_state,
+                        relation_group_key,
+                        relation_owner["id"] if relation_owner else None,
                     ),
                 )
                 incident_row = cur.fetchone()
                 incident_row["incident_no"] = self._next_incident_no(cur, incident_row["id"])
+                cur.execute(
+                    "UPDATE incidents SET root_incident_id = id, remediation_owner_incident_id = COALESCE(remediation_owner_incident_id, %s) WHERE id = %s",
+                    ((relation_owner["id"] if relation_owner else incident_row["id"]), incident_row["id"]),
+                )
             incident_id = incident_row["id"]
             cur.execute(
                 """
@@ -1839,6 +3511,7 @@ class AIOpsService:
             "incident_no": incident_row["incident_no"],
             "title": incident_row["title"],
             "status": incident_row["status"],
+            "workflow_phase": incident_row.get("workflow_phase") or "none",
             "severity": incident_row["severity"],
             "event_family": incident_row["event_family"],
             "primary_source_ip": incident_row["primary_source_ip"],
@@ -1850,8 +3523,11 @@ class AIOpsService:
             "version": device["version"] if device else "",
             "current_recovery_state": incident_row["current_recovery_state"],
             "category": incident_row["category"],
+            "metadata": incident_row.get("metadata") or {},
         }
         summary = generate_ai_summary(incident_payload, raw_logs)
+        if incident_payload["metadata"].get("cause_hint") == "linked_admin_down":
+            summary["category"] = "config-related"
         cur.execute(
             """
             INSERT INTO ai_summaries (
@@ -1903,38 +3579,111 @@ class AIOpsService:
             {"category": summary["category"], "confidence_score": summary["confidence_score"]},
         )
 
+    @staticmethod
+    def _resolved_raw_log_hostname_sql(raw_alias: str, device_alias: str) -> str:
+        return (
+            "COALESCE("
+            f"NULLIF(NULLIF(BTRIM({raw_alias}.hostname), ''), {raw_alias}.source_ip), "
+            f"{device_alias}.hostname, "
+            f"{raw_alias}.source_ip"
+            ")"
+        )
+
     def _fetch_open_incidents(self, *, include_resolved: bool) -> list[dict[str, Any]]:
-        where_clause = "" if include_resolved else "WHERE status <> ALL(%s)"
-        params: list[Any] = [] if include_resolved else [["resolved", "closed"]]
+        where_clauses = [
+            "COALESCE(i.suppressed_in_list, FALSE) = FALSE",
+            "COALESCE(i.metadata->>'deprecated_root', 'false') <> 'true'",
+        ]
+        params: list[Any] = []
+        if not include_resolved:
+            where_clauses.append("i.status <> ALL(%s)")
+            params.append(["resolved", "closed"])
+        where_clause = f"WHERE {' AND '.join(where_clauses)}"
         with connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    SELECT i.*, d.hostname AS primary_hostname
+                    SELECT
+                        i.*,
+                        d.hostname AS primary_hostname,
+                        (
+                            SELECT COUNT(*)
+                            FROM incidents related
+                            WHERE related.relation_group_key = i.relation_group_key
+                              AND related.id <> i.id
+                              AND COALESCE(related.suppressed_in_list, FALSE) = FALSE
+                              AND COALESCE(related.metadata->>'deprecated_root', 'false') <> 'true'
+                        ) AS child_count,
+                        (
+                            SELECT COUNT(*)
+                            FROM incidents related
+                            WHERE related.relation_group_key = i.relation_group_key
+                              AND related.id <> i.id
+                              AND COALESCE(related.suppressed_in_list, FALSE) = FALSE
+                              AND COALESCE(related.metadata->>'deprecated_root', 'false') <> 'true'
+                              AND related.status = ANY(%s)
+                        ) AS active_child_count
                     FROM incidents i
                     LEFT JOIN devices d ON d.id = i.primary_device_id
                     {where_clause}
                     ORDER BY i.last_seen_at DESC
                     """,
-                    params,
+                    [list(_OPEN_INCIDENT_STATUSES), *params],
                 )
                 return cur.fetchall()
 
     def dashboard(self) -> dict[str, Any]:
+        self._refresh_time_based_incident_states()
         incidents = self._fetch_open_incidents(include_resolved=False)
         history = self.history(limit=20)
         approvals = self.approvals(limit=20)
         with connect() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) AS count FROM incidents WHERE status IN ('recovering', 'monitoring')")
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM incidents
+                    WHERE status = 'active'
+                      AND COALESCE(suppressed_in_list, FALSE) = FALSE
+                      AND COALESCE(metadata->>'deprecated_root', 'false') <> 'true'
+                    """,
+                )
+                active = cur.fetchone()["count"]
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM incidents
+                    WHERE status IN ('recovering', 'monitoring')
+                      AND COALESCE(suppressed_in_list, FALSE) = FALSE
+                      AND COALESCE(metadata->>'deprecated_root', 'false') <> 'true'
+                    """,
+                )
                 recovering = cur.fetchone()["count"]
-                cur.execute("SELECT COUNT(*) AS count FROM incidents WHERE status = 'resolved' AND resolved_at >= NOW() - INTERVAL '1 day'")
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM incidents
+                    WHERE status = 'resolved'
+                      AND resolved_at >= NOW() - INTERVAL '1 day'
+                      AND COALESCE(suppressed_in_list, FALSE) = FALSE
+                      AND COALESCE(metadata->>'deprecated_root', 'false') <> 'true'
+                    """,
+                )
                 resolved_today = cur.fetchone()["count"]
-                cur.execute("SELECT COUNT(*) AS count FROM incidents WHERE reopened_count > 0 AND last_seen_at >= NOW() - INTERVAL '7 day'")
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM incidents
+                    WHERE reopened_count > 0
+                      AND last_seen_at >= NOW() - INTERVAL '7 day'
+                      AND COALESCE(suppressed_in_list, FALSE) = FALSE
+                      AND COALESCE(metadata->>'deprecated_root', 'false') <> 'true'
+                    """,
+                )
                 reopened = cur.fetchone()["count"]
         return {
             "metrics": {
-                "active_incidents": len(incidents),
+                "active_incidents": active,
                 "recovering_incidents": recovering,
                 "pending_approvals": sum(1 for p in approvals if p["status"] in ("pending", "approved")),
                 "resolved_today": resolved_today,
@@ -1946,6 +3695,7 @@ class AIOpsService:
         }
 
     def incidents(self) -> list[dict[str, Any]]:
+        self._refresh_time_based_incident_states()
         return self._fetch_open_incidents(include_resolved=False)
 
     def history(self, limit: int = 100) -> list[dict[str, Any]]:
@@ -1953,14 +3703,35 @@ class AIOpsService:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT i.*, d.hostname AS primary_hostname
+                    SELECT
+                        i.*,
+                        d.hostname AS primary_hostname,
+                        (
+                            SELECT COUNT(*)
+                            FROM incidents related
+                            WHERE related.relation_group_key = i.relation_group_key
+                              AND related.id <> i.id
+                              AND COALESCE(related.suppressed_in_list, FALSE) = FALSE
+                              AND COALESCE(related.metadata->>'deprecated_root', 'false') <> 'true'
+                        ) AS child_count,
+                        (
+                            SELECT COUNT(*)
+                            FROM incidents related
+                            WHERE related.relation_group_key = i.relation_group_key
+                              AND related.id <> i.id
+                              AND COALESCE(related.suppressed_in_list, FALSE) = FALSE
+                              AND COALESCE(related.metadata->>'deprecated_root', 'false') <> 'true'
+                              AND related.status = ANY(%s)
+                        ) AS active_child_count
                     FROM incidents i
                     LEFT JOIN devices d ON d.id = i.primary_device_id
                     WHERE i.status IN ('resolved', 'closed')
+                      AND COALESCE(i.suppressed_in_list, FALSE) = FALSE
+                      AND COALESCE(i.metadata->>'deprecated_root', 'false') <> 'true'
                     ORDER BY COALESCE(i.resolved_at, i.updated_at) DESC
                     LIMIT %s
                     """,
-                    (limit,),
+                    (list(_OPEN_INCIDENT_STATUSES), limit),
                 )
                 return cur.fetchall()
 
@@ -2000,8 +3771,18 @@ class AIOpsService:
                     where = " AND ".join(conditions)
                     cur.execute(
                         f"""
-                        SELECT rl.*, i.incident_no
+                        SELECT
+                            rl.id,
+                            rl.source_ip,
+                            {self._resolved_raw_log_hostname_sql("rl", "d_src")} AS hostname,
+                            rl.raw_message,
+                            rl.event_time,
+                            rl.received_at,
+                            rl.parse_status,
+                            rl.metadata,
+                            i.incident_no
                         FROM raw_logs rl
+                        LEFT JOIN devices d_src ON d_src.ip_address = rl.source_ip
                         JOIN events e ON e.raw_log_id = rl.id
                         JOIN incident_events ie ON ie.event_id = e.id
                         JOIN incidents i ON i.id = ie.incident_id
@@ -2043,10 +3824,18 @@ class AIOpsService:
                         f"""
                         SELECT * FROM (
                             SELECT
-                                rl.*,
+                                rl.id,
+                                rl.source_ip,
+                                {self._resolved_raw_log_hostname_sql("rl", "d_src")} AS hostname,
+                                rl.raw_message,
+                                rl.event_time,
+                                rl.received_at,
+                                rl.parse_status,
+                                rl.metadata,
                                 i.incident_no,
                                 ROW_NUMBER() OVER (PARTITION BY rl.id ORDER BY ie.id DESC NULLS LAST, i.id DESC NULLS LAST) AS row_rank
                             FROM raw_logs rl
+                            LEFT JOIN devices d_src ON d_src.ip_address = rl.source_ip
                             LEFT JOIN events e ON e.raw_log_id = rl.id
                             LEFT JOIN incident_events ie ON ie.event_id = e.id
                             LEFT JOIN incidents i ON i.id = ie.incident_id
@@ -2099,13 +3888,17 @@ class AIOpsService:
                     """
                     SELECT
                         d.*,
-                        COUNT(*) FILTER (WHERE i.status <> ALL(ARRAY['resolved','closed'])) AS open_incident_count,
+                        COUNT(*) FILTER (
+                            WHERE i.status <> ALL(ARRAY['resolved','closed'])
+                              AND COALESCE(i.suppressed_in_list, FALSE) = FALSE
+                              AND COALESCE(i.metadata->>'deprecated_root', 'false') <> 'true'
+                        ) AS open_incident_count,
                         MAX(i.last_seen_at) AS last_incident_seen
                     FROM devices d
                     LEFT JOIN incidents i ON i.primary_device_id = d.id
                     GROUP BY d.id
                     ORDER BY d.hostname
-                    """
+                    """,
                 )
                 return cur.fetchall()
 
@@ -2116,7 +3909,11 @@ class AIOpsService:
                     """
                     SELECT
                         d.*,
-                        COUNT(*) FILTER (WHERE i.status <> ALL(ARRAY['resolved','closed'])) AS open_incident_count,
+                        COUNT(*) FILTER (
+                            WHERE i.status <> ALL(ARRAY['resolved','closed'])
+                              AND COALESCE(i.suppressed_in_list, FALSE) = FALSE
+                              AND COALESCE(i.metadata->>'deprecated_root', 'false') <> 'true'
+                        ) AS open_incident_count,
                         MAX(i.last_seen_at) AS last_incident_seen
                     FROM devices d
                     LEFT JOIN incidents i ON i.primary_device_id = d.id
@@ -2132,6 +3929,8 @@ class AIOpsService:
                     """
                     SELECT i.* FROM incidents i
                     WHERE i.primary_source_ip = %s
+                      AND COALESCE(i.suppressed_in_list, FALSE) = FALSE
+                      AND COALESCE(i.metadata->>'deprecated_root', 'false') <> 'true'
                     ORDER BY i.last_seen_at DESC
                     LIMIT 50
                     """,
@@ -2580,31 +4379,137 @@ class AIOpsService:
                 row = cur.fetchone()
                 if row is None:
                     raise KeyError(f"Incident {incident_no} not found")
-                self._append_timeline(
+                self._record_timeline(
                     cur,
-                    incident_id=row["id"],
-                    kind="engineer_note",
-                    title=f"Note by {author or 'engineer'}",
-                    body=body.strip(),
-                    payload={"author": author or "engineer"},
+                    row["id"],
+                    "engineer_note",
+                    f"Note by {author or 'engineer'}",
+                    body.strip(),
+                    {"author": author or "engineer"},
                 )
             conn.commit()
 
     def get_incident(self, incident_no: str) -> dict[str, Any]:
+        self._refresh_time_based_incident_states()
         with connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT i.*, d.hostname AS primary_hostname, d.os_platform, d.device_role
+                    SELECT
+                        i.*,
+                        d.hostname AS primary_hostname,
+                        d.os_platform,
+                        d.device_role,
+                        (
+                            SELECT COUNT(*)
+                            FROM incidents related
+                            WHERE related.relation_group_key = i.relation_group_key
+                              AND related.id <> i.id
+                              AND COALESCE(related.suppressed_in_list, FALSE) = FALSE
+                              AND COALESCE(related.metadata->>'deprecated_root', 'false') <> 'true'
+                        ) AS child_count,
+                        (
+                            SELECT COUNT(*)
+                            FROM incidents related
+                            WHERE related.relation_group_key = i.relation_group_key
+                              AND related.id <> i.id
+                              AND COALESCE(related.suppressed_in_list, FALSE) = FALSE
+                              AND COALESCE(related.metadata->>'deprecated_root', 'false') <> 'true'
+                              AND related.status = ANY(%s)
+                        ) AS active_child_count
                     FROM incidents i
                     LEFT JOIN devices d ON d.id = i.primary_device_id
                     WHERE i.incident_no = %s
+                      AND COALESCE(i.suppressed_in_list, FALSE) = FALSE
+                      AND COALESCE(i.metadata->>'deprecated_root', 'false') <> 'true'
                     """,
-                    (incident_no,),
+                    (list(_OPEN_INCIDENT_STATUSES), incident_no),
                 )
                 incident = cur.fetchone()
                 if incident is None:
                     raise KeyError(f"Incident {incident_no} not found")
+                related_incidents: list[dict[str, Any]] = []
+                remediation_owner_incident: dict[str, Any] | None = None
+                relation_group_key = incident.get("relation_group_key")
+                if relation_group_key:
+                    cur.execute(
+                        """
+                        SELECT
+                            i.*,
+                            d.hostname AS primary_hostname,
+                            (
+                                SELECT COUNT(*)
+                                FROM incidents related
+                                WHERE related.relation_group_key = i.relation_group_key
+                                  AND related.id <> i.id
+                                  AND COALESCE(related.suppressed_in_list, FALSE) = FALSE
+                                  AND COALESCE(related.metadata->>'deprecated_root', 'false') <> 'true'
+                            ) AS child_count,
+                            (
+                                SELECT COUNT(*)
+                                FROM incidents related
+                                WHERE related.relation_group_key = i.relation_group_key
+                                  AND related.id <> i.id
+                                  AND COALESCE(related.suppressed_in_list, FALSE) = FALSE
+                                  AND COALESCE(related.metadata->>'deprecated_root', 'false') <> 'true'
+                                  AND related.status = ANY(%s)
+                            ) AS active_child_count
+                        FROM incidents i
+                        LEFT JOIN devices d ON d.id = i.primary_device_id
+                        WHERE i.relation_group_key = %s
+                          AND i.id <> %s
+                          AND COALESCE(i.suppressed_in_list, FALSE) = FALSE
+                          AND COALESCE(i.metadata->>'deprecated_root', 'false') <> 'true'
+                        ORDER BY i.last_seen_at DESC
+                        """,
+                        (list(_OPEN_INCIDENT_STATUSES), relation_group_key, incident["id"]),
+                    )
+                    related_rows = cur.fetchall()
+                    related_incidents = [
+                        {
+                            "incident": row,
+                            "relation_reason": _incident_metadata(row).get("relation_reason")
+                            or _incident_metadata(incident).get("cause_hint")
+                            or "linked_context",
+                            "relation_confidence": _incident_metadata(row).get("topology_confidence")
+                            or _incident_metadata(incident).get("topology_confidence")
+                            or "",
+                            "owns_remediation": _incident_owns_remediation(row),
+                        }
+                        for row in related_rows
+                    ]
+
+                owner_id = _incident_remediation_owner_id(incident)
+                if owner_id is not None and owner_id != incident["id"]:
+                    cur.execute(
+                        """
+                        SELECT
+                            i.*,
+                            d.hostname AS primary_hostname,
+                            (
+                                SELECT COUNT(*)
+                                FROM incidents related
+                                WHERE related.relation_group_key = i.relation_group_key
+                                  AND related.id <> i.id
+                                  AND COALESCE(related.suppressed_in_list, FALSE) = FALSE
+                                  AND COALESCE(related.metadata->>'deprecated_root', 'false') <> 'true'
+                            ) AS child_count,
+                            (
+                                SELECT COUNT(*)
+                                FROM incidents related
+                                WHERE related.relation_group_key = i.relation_group_key
+                                  AND related.id <> i.id
+                                  AND COALESCE(related.suppressed_in_list, FALSE) = FALSE
+                                  AND COALESCE(related.metadata->>'deprecated_root', 'false') <> 'true'
+                                  AND related.status = ANY(%s)
+                            ) AS active_child_count
+                        FROM incidents i
+                        LEFT JOIN devices d ON d.id = i.primary_device_id
+                        WHERE i.id = %s
+                        """,
+                        (list(_OPEN_INCIDENT_STATUSES), owner_id),
+                    )
+                    remediation_owner_incident = cur.fetchone()
                 cur.execute(
                     """
                     SELECT * FROM incident_timeline
@@ -2661,10 +4566,24 @@ class AIOpsService:
                 execution = cur.fetchone()
                 cur.execute(
                     """
-                    SELECT rl.*
+                    SELECT
+                        rl.id,
+                        rl.source_ip,
+                        COALESCE(NULLIF(NULLIF(BTRIM(rl.hostname), ''), rl.source_ip), d_src.hostname, rl.source_ip) AS hostname,
+                        rl.raw_message,
+                        rl.event_time,
+                        rl.received_at,
+                        rl.parse_status,
+                        rl.metadata,
+                        i.incident_no,
+                        i.title AS incident_title,
+                        COALESCE(d_inc.hostname, i.primary_source_ip) AS incident_hostname
                     FROM raw_logs rl
+                    LEFT JOIN devices d_src ON d_src.ip_address = rl.source_ip
                     JOIN events e ON e.raw_log_id = rl.id
                     JOIN incident_events ie ON ie.event_id = e.id
+                    JOIN incidents i ON i.id = ie.incident_id
+                    LEFT JOIN devices d_inc ON d_inc.id = i.primary_device_id
                     WHERE ie.incident_id = %s
                     ORDER BY rl.received_at DESC
                     LIMIT 20
@@ -2674,10 +4593,17 @@ class AIOpsService:
                 raw_logs = cur.fetchall()
                 cur.execute(
                     """
-                    SELECT e.*, rl.raw_message
+                    SELECT
+                        e.*,
+                        rl.raw_message,
+                        i.incident_no,
+                        i.title AS incident_title,
+                        COALESCE(d_inc.hostname, i.primary_source_ip) AS incident_hostname
                     FROM events e
                     LEFT JOIN raw_logs rl ON rl.id = e.raw_log_id
                     JOIN incident_events ie ON ie.event_id = e.id
+                    JOIN incidents i ON i.id = ie.incident_id
+                    LEFT JOIN devices d_inc ON d_inc.id = i.primary_device_id
                     WHERE ie.incident_id = %s
                     ORDER BY e.created_at DESC
                     LIMIT 20
@@ -2687,6 +4613,8 @@ class AIOpsService:
                 events = cur.fetchall()
         return {
             "incident": incident,
+            "related_incidents": related_incidents,
+            "remediation_owner_incident": remediation_owner_incident,
             "timeline": timeline,
             "ai_summary": ai_summary,
             "troubleshoot": troubleshoot,
@@ -2699,8 +4627,32 @@ class AIOpsService:
     def run_troubleshoot(self, incident_no: str) -> dict[str, Any]:
         detail = self.get_incident(incident_no)
         incident = detail["incident"]
+        existing_proposal = detail.get("proposal")
+        previous_workflow_phase = _incident_workflow_phase(incident)
+        requires_intent_confirmation = _needs_intent_confirmation(incident)
+        with connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE incidents
+                    SET workflow_phase = 'ai_investigating',
+                        updated_at = NOW()
+                    WHERE id = %s
+                      AND status <> 'resolved'
+                    """,
+                    (incident["id"],),
+                )
+            conn.commit()
+        incident = {**incident, "workflow_phase": "ai_investigating"}
         device_cache = self._fetch_device_cache()
         result = run_llm_troubleshoot(incident, detail["raw_logs"], device_cache)
+        if requires_intent_confirmation:
+            result["disposition"] = "needs_human_review"
+            result["proposal"] = None
+            if "intent confirmation" not in result["conclusion"].lower():
+                result["conclusion"] += (
+                    " Human intent confirmation is required before any no shutdown remediation can be proposed."
+                )
         with connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2723,7 +4675,8 @@ class AIOpsService:
                 )
                 # Build proposal first — status depends on whether one was actually created
                 proposal = None
-                if result.get("proposal"):
+                proposal_allowed = not requires_intent_confirmation
+                if result.get("proposal") and proposal_allowed:
                     proposal_data = result["proposal"]
                     target_devices = [
                         device_cache[name]["hostname"] if name in device_cache else name
@@ -2759,13 +4712,26 @@ class AIOpsService:
                 status_map = {
                     "no_action_needed": ("resolved", "no_action_needed"),
                     "self_recovered": ("monitoring", "self_recovered"),
-                    "monitor_further": ("investigating", None),
-                    "physical_issue": ("escalated", "physical_handoff"),
-                    "external_issue": ("escalated", "external_handoff"),
-                    "config_fix_possible": ("awaiting_approval" if proposal else "investigating", None),
-                    "needs_human_review": ("investigating", None),
+                    "monitor_further": ("active", None),
+                    "physical_issue": ("active", "physical_handoff"),
+                    "external_issue": ("active", "external_handoff"),
+                    "config_fix_possible": ("active", None),
+                    "needs_human_review": ("active", None),
                 }
-                next_status, resolution_type = status_map.get(disposition, ("investigating", None))
+                next_status, resolution_type = status_map.get(disposition, ("active", None))
+                if requires_intent_confirmation:
+                    next_status, resolution_type = ("active", None)
+                next_workflow_phase = {
+                    "no_action_needed": "none",
+                    "self_recovered": "none",
+                    "monitor_further": "none",
+                    "physical_issue": "escalated_physical",
+                    "external_issue": "escalated_external",
+                    "config_fix_possible": "remediation_available" if proposal else "none",
+                    "needs_human_review": "none",
+                }.get(disposition, "none")
+                if requires_intent_confirmation:
+                    next_workflow_phase = "intent_confirmation_required"
                 # Re-fetch current status — a recovery signal may have arrived while
                 # troubleshoot was running and already advanced the incident to
                 # "recovering" or "monitoring".  Never downgrade those states.
@@ -2776,6 +4742,13 @@ class AIOpsService:
                 if current_status in _RECOVERY_FORWARD_STATUSES and next_status not in _RECOVERY_FORWARD_STATUSES:
                     # Preserve the recovery-forward status; only log the troubleshoot result
                     next_status = current_status
+                if (
+                    proposal is None
+                    and existing_proposal is not None
+                    and next_workflow_phase == "none"
+                    and disposition in {"monitor_further", "needs_human_review", "config_fix_possible"}
+                ):
+                    next_workflow_phase = _proposal_workflow_phase(existing_proposal.get("status"))
                 # no_action_needed: port is intentionally inactive — resolve immediately, skip proposal
                 if disposition == "no_action_needed":
                     proposal = None  # discard any proposal that may have been built
@@ -2783,7 +4756,9 @@ class AIOpsService:
                         """
                         UPDATE incidents
                         SET status = 'resolved',
+                            workflow_phase = 'none',
                             resolution_type = 'no_action_needed',
+                            current_proposal_id = NULL,
                             resolved_at = NOW(),
                             updated_at = NOW()
                         WHERE id = %s
@@ -2794,24 +4769,29 @@ class AIOpsService:
                     cur.execute(
                         """
                         UPDATE incidents
-                        SET status = 'awaiting_approval',
+                        SET status = %s,
+                            workflow_phase = 'remediation_available',
                             current_proposal_id = %s,
                             resolution_type = COALESCE(%s, resolution_type),
+                            resolved_at = NULL,
                             updated_at = NOW()
                         WHERE id = %s
                         """,
-                        (proposal["id"], resolution_type, incident["id"]),
+                        (next_status, proposal["id"], resolution_type, incident["id"]),
                     )
                 else:
                     cur.execute(
                         """
                         UPDATE incidents
                         SET status = %s,
+                            workflow_phase = %s,
+                            current_proposal_id = CASE WHEN %s = 'none' THEN NULL ELSE current_proposal_id END,
                             resolution_type = COALESCE(%s, resolution_type),
+                            resolved_at = CASE WHEN %s = 'resolved' THEN COALESCE(resolved_at, NOW()) ELSE NULL END,
                             updated_at = NOW()
                         WHERE id = %s
                         """,
-                        (next_status, resolution_type, incident["id"]),
+                        (next_status, next_workflow_phase, next_workflow_phase, resolution_type, next_status, incident["id"]),
                     )
                 self._record_timeline(
                     cur,
@@ -2852,7 +4832,7 @@ class AIOpsService:
                 cur.execute(
                     """
                     UPDATE incidents
-                    SET status = 'approved', updated_at = NOW()
+                    SET workflow_phase = 'approved_to_execute', updated_at = NOW()
                     WHERE id = %s
                     """,
                     (detail["incident"]["id"],),
@@ -2865,6 +4845,182 @@ class AIOpsService:
                     f"Approved by {actor}",
                     {"proposal_id": proposal["id"], "actor": actor},
                 )
+            conn.commit()
+        return self.get_incident(incident_no)
+
+    def confirm_incident_intent(
+        self,
+        incident_no: str,
+        *,
+        intent: str,
+        note: str,
+        actor: str | None = None,
+    ) -> dict[str, Any]:
+        if intent not in {"intentional", "unintentional"}:
+            raise ValueError("intent must be 'intentional' or 'unintentional'")
+
+        detail = self.get_incident(incident_no)
+        incident = detail["incident"]
+        owner_id = _incident_remediation_owner_id(incident)
+        if owner_id is not None and owner_id != incident["id"]:
+            raise ValueError("shutdown intent must be confirmed on the remediation-owning incident")
+        metadata = _incident_metadata(incident)
+        if metadata.get("cause_hint") != "linked_admin_down":
+            raise ValueError("incident does not require shutdown intent confirmation")
+
+        current_intent_status = metadata.get("intent_status")
+        if intent == "intentional" and current_intent_status == "confirmed_intentional":
+            return detail
+        if intent == "unintentional" and current_intent_status == "confirmed_unintentional" and detail.get("proposal"):
+            return detail
+        if current_intent_status != "needs_confirmation":
+            raise ValueError("shutdown intent has already been confirmed")
+
+        updated_metadata = {
+            **metadata,
+            "intent_status": "confirmed_intentional" if intent == "intentional" else "confirmed_unintentional",
+            "intent_note": note,
+            "intent_actor": actor or "",
+            "intent_confirmed_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                if intent == "intentional":
+                    cur.execute(
+                        """
+                        UPDATE proposals
+                        SET status = 'cancelled',
+                            cancelled_reason = 'confirmed_intentional_shutdown'
+                        WHERE incident_id = %s
+                          AND status IN ('pending', 'approved')
+                        """,
+                        (incident["id"],),
+                    )
+                    relation_group_key = incident.get("relation_group_key")
+                    if relation_group_key:
+                        cur.execute(
+                            """
+                            UPDATE incidents
+                            SET status = 'resolved',
+                                workflow_phase = 'none',
+                                resolution_type = CASE
+                                    WHEN id = %s THEN 'confirmed_intentional_shutdown'
+                                    ELSE 'resolved_by_related_decision'
+                                END,
+                                resolved_at = NOW(),
+                                current_proposal_id = NULL,
+                                current_recovery_state = 'resolved',
+                                updated_at = NOW()
+                            WHERE relation_group_key = %s
+                              AND COALESCE(suppressed_in_list, FALSE) = FALSE
+                              AND COALESCE(metadata->>'deprecated_root', 'false') <> 'true'
+                              AND status <> 'resolved'
+                            """,
+                            (incident["id"], relation_group_key),
+                        )
+                    cur.execute(
+                        """
+                        UPDATE incidents
+                        SET status = 'resolved',
+                            workflow_phase = 'none',
+                            resolution_type = 'confirmed_intentional_shutdown',
+                            resolved_at = NOW(),
+                            current_proposal_id = NULL,
+                            current_recovery_state = 'resolved',
+                            metadata = %s::jsonb,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (Json(updated_metadata), incident["id"]),
+                    )
+                    self._record_timeline(
+                        cur,
+                        incident["id"],
+                        "decision",
+                        "Shutdown intent confirmed",
+                        note,
+                        {"intent": intent, "actor": actor or "", "cause_hint": "linked_admin_down"},
+                    )
+                else:
+                    root_host = str(metadata.get("root_host") or "").strip()
+                    root_interface = str(metadata.get("root_interface") or "").strip()
+                    remote_host = str(metadata.get("remote_host") or "").strip()
+                    remote_interface = str(metadata.get("remote_interface") or "").strip()
+                    if not root_host or not root_interface:
+                        raise ValueError("incident is missing root interface context for remediation")
+
+                    rationale = (
+                        f"Remote impact on {remote_host or 'the peer'} {remote_interface or 'interface'} correlates with "
+                        f"an admin shutdown on {root_host} {root_interface}. After human confirmation that the shutdown "
+                        "was unintended, restoring the interface is the safest remediation path."
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO proposals (
+                            incident_id, title, rationale, target_devices, commands,
+                            rollback_commands, rollback_plan, expected_impact,
+                            verification_commands, risk_level
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING *
+                        """,
+                        (
+                            incident["id"],
+                            f"Restore {root_host} {root_interface}",
+                            rationale,
+                            Json([root_host]),
+                            Json([f"interface {root_interface}", "no shutdown"]),
+                            Json([f"interface {root_interface}", "shutdown"]),
+                            f"Re-apply shutdown on {root_interface} if verification fails or the change is later deemed intentional.",
+                            f"Should restore the linked path impacted by the admin shutdown on {root_host} {root_interface}.",
+                            Json([f"show interface {root_interface}"]),
+                            "medium",
+                        ),
+                    )
+                    proposal = cur.fetchone()
+                    cur.execute(
+                        """
+                        UPDATE incidents
+                        SET status = 'active',
+                            workflow_phase = 'remediation_available',
+                            current_proposal_id = %s,
+                            resolution_type = NULL,
+                            resolved_at = NULL,
+                            metadata = %s::jsonb,
+                            updated_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (proposal["id"], Json(updated_metadata), incident["id"]),
+                    )
+                    cur.execute(
+                        """
+                        UPDATE incidents
+                        SET remediation_owner_incident_id = %s,
+                            updated_at = NOW()
+                        WHERE relation_group_key = %s
+                          AND id <> %s
+                          AND COALESCE(suppressed_in_list, FALSE) = FALSE
+                          AND COALESCE(metadata->>'deprecated_root', 'false') <> 'true'
+                        """,
+                        (incident["id"], incident.get("relation_group_key"), incident["id"]),
+                    )
+                    self._record_timeline(
+                        cur,
+                        incident["id"],
+                        "decision",
+                        "Shutdown intent confirmed",
+                        note,
+                        {"intent": intent, "actor": actor or "", "cause_hint": "linked_admin_down"},
+                    )
+                    self._record_timeline(
+                        cur,
+                        incident["id"],
+                        "proposal",
+                        "Remediation proposal created after intent confirmation",
+                        proposal["title"],
+                        {"proposal_id": proposal["id"], "intent": intent},
+                    )
             conn.commit()
         return self.get_incident(incident_no)
 
@@ -2920,6 +5076,8 @@ class AIOpsService:
                 verification_status = "auto_checked"
                 verification_notes = "\n\n".join(verify_parts)
 
+        verification_state = _verification_signal_state(verification_notes if verification_status == "auto_checked" else None)
+
         with connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2942,11 +5100,46 @@ class AIOpsService:
                     ),
                 )
                 execution = cur.fetchone()
-                # failed + rollback → back to active; success → verifying
-                next_status = "verifying" if status == "completed" else "active"
+                if status != "completed":
+                    next_status = "active"
+                    next_workflow_phase = "none"
+                    next_resolution_type = None
+                    resolved_at: datetime | None = None
+                elif verification_state == "positive":
+                    next_status = "resolved"
+                    next_workflow_phase = "none"
+                    next_resolution_type = "verified_recovery"
+                    resolved_at = datetime.now(timezone.utc)
+                elif verification_state == "negative":
+                    next_status = "active"
+                    next_workflow_phase = "none"
+                    next_resolution_type = None
+                    resolved_at = None
+                else:
+                    next_status = "active"
+                    next_workflow_phase = "none"
+                    next_resolution_type = None
+                    resolved_at = None
                 cur.execute(
-                    "UPDATE incidents SET status = %s, updated_at = NOW() WHERE id = %s",
-                    (next_status, incident["id"]),
+                    """
+                    UPDATE incidents
+                    SET status = %s,
+                        workflow_phase = %s,
+                        current_proposal_id = NULL,
+                        resolution_type = COALESCE(%s, resolution_type),
+                        resolved_at = %s,
+                        current_recovery_state = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (
+                        next_status,
+                        next_workflow_phase,
+                        next_resolution_type,
+                        resolved_at,
+                        "resolved" if next_status == "resolved" else "watching",
+                        incident["id"],
+                    ),
                 )
                 cur.execute(
                     "UPDATE proposals SET status = 'executed' WHERE id = %s",
@@ -2956,14 +5149,24 @@ class AIOpsService:
                 if status == "failed" and rollback_commands:
                     timeline_note += " — rollback commands automatically applied"
                 elif status == "completed" and verification_status == "auto_checked":
-                    timeline_note += " — verification commands collected automatically"
+                    if verification_state == "positive":
+                        timeline_note += " — explicit positive verification evidence resolved the incident"
+                    elif verification_state == "negative":
+                        timeline_note += " — verification output still shows the fault"
+                    else:
+                        timeline_note += " — verification commands collected automatically"
                 self._record_timeline(
                     cur,
                     incident["id"],
                     "execution",
                     "Approved commands executed",
                     timeline_note,
-                    {"execution_id": execution["id"], "actor": actor, "auto_verified": verification_status == "auto_checked"},
+                    {
+                        "execution_id": execution["id"],
+                        "actor": actor,
+                        "auto_verified": verification_status == "auto_checked",
+                        "verification_state": verification_state,
+                    },
                 )
             conn.commit()
         return self.get_incident(incident_no)
@@ -2971,7 +5174,7 @@ class AIOpsService:
     def verify_recovery(self, incident_no: str, healed: bool, note: str) -> dict[str, Any]:
         detail = self.get_incident(incident_no)
         incident = detail["incident"]
-        next_status = "monitoring" if healed else "investigating"
+        next_status = "monitoring" if healed else "active"
         resolution_type = "verified_recovery" if healed else None
         with connect() as conn:
             with conn.cursor() as cur:
@@ -2979,13 +5182,15 @@ class AIOpsService:
                     """
                     UPDATE incidents
                     SET status = %s,
+                        workflow_phase = 'none',
                         resolution_type = CASE WHEN %s THEN COALESCE(%s, resolution_type) ELSE NULL END,
                         resolved_at = NULL,
+                        current_proposal_id = CASE WHEN %s THEN current_proposal_id ELSE NULL END,
                         current_recovery_state = %s,
                         updated_at = NOW()
                     WHERE id = %s
                     """,
-                    (next_status, healed, resolution_type, "monitoring" if healed else "watching", incident["id"]),
+                    (next_status, healed, resolution_type, healed, "monitoring" if healed else "watching", incident["id"]),
                 )
                 self._record_timeline(
                     cur,

@@ -49,7 +49,13 @@ from src.tools.interface_inventory import (
     resolve_ip_context,
     resolve_prefix_context,
 )
-from src.tools.inventory_tools import list_all_devices, lookup_device, resolve_inventory_record
+from src.tools.inventory_tools import (
+    list_all_devices,
+    lookup_device,
+    normalize_device_role,
+    resolve_inventory_record,
+    resolve_inventory_role,
+)
 from src.tools.db_tools import search_logs, search_incidents, get_incident_detail
 from src.formatters import extract_executed_command, is_command_error, parse_output, strip_tool_metadata
 
@@ -180,6 +186,17 @@ _ROUTING_ROLE_PRIORITY = {
     "dist_switch": 2,
     "access_switch": 3,
 }
+_ROLE_SCOPE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("core_router", re.compile(r"\bcore(?:[_\s-]+)routers?\b", re.IGNORECASE)),
+    ("dist_switch", re.compile(r"\bdist(?:[_\s-]+)switch(?:es)?\b", re.IGNORECASE)),
+    ("access_switch", re.compile(r"\baccess(?:[_\s-]+)switch(?:es)?\b", re.IGNORECASE)),
+    ("router", re.compile(r"\brouters?\b", re.IGNORECASE)),
+)
+_ROLE_SCOPE_DIRECT_CHECK_RE = re.compile(
+    r"(show|check|ssh|reachable|reachability|status|summary|bgp|ospf|eigrp|"
+    r"interface|version|ping|traceroute|trace|route|routing)",
+    re.IGNORECASE,
+)
 _TRACE_SYMMETRY_QUERY_RE = re.compile(
     r"(same\s+path|same\s+route|path\s+symmetr|route\s+symmetr|"
     r"symmetric|asymmetric|forward.*reverse.*traceroute|"
@@ -258,6 +275,75 @@ def _device_info_for_host(hostname: str, device_cache: dict) -> dict[str, Any]:
 
 def _is_routing_capable_role(role: str) -> bool:
     return (role or "").strip().lower() in _ROUTING_CAPABLE_ROLES
+
+
+def _extract_query_role_scopes(query: str) -> list[str]:
+    remaining = query or ""
+    roles: list[str] = []
+    for role, pattern in _ROLE_SCOPE_PATTERNS:
+        if not pattern.search(remaining):
+            continue
+        roles.append(role)
+        remaining = pattern.sub(" ", remaining)
+    return roles
+
+
+def _resolve_role_scope_records(role_token: str) -> list[dict[str, Any]]:
+    normalized = normalize_device_role(role_token)
+    if not normalized:
+        return []
+    return resolve_inventory_role(normalized)
+
+
+def _analyze_role_scope(user_query: str, device_cache: dict) -> dict[str, Any]:
+    requested_roles = _extract_query_role_scopes(user_query)
+    hosts: list[str] = []
+    host_roles: dict[str, str] = {}
+    seen_hosts: set[str] = set()
+
+    for role in requested_roles:
+        for record in _resolve_role_scope_records(role):
+            _cache_inventory_record(device_cache, record)
+            hostname = str(record.get("hostname", "") or "").strip()
+            if not hostname or hostname in seen_hosts:
+                continue
+            seen_hosts.add(hostname)
+            hosts.append(hostname)
+            host_roles[hostname] = str(record.get("device_role", "") or role).strip()
+
+    ordered_hosts = sorted(hosts, key=lambda host: _role_priority_for_host(host, device_cache))
+    return {
+        "requested_roles": requested_roles,
+        "hosts": ordered_hosts,
+        "host_roles": host_roles,
+    }
+
+
+def _build_role_scope_section(analysis: dict[str, Any], device_cache: dict) -> str:
+    requested_roles = analysis.get("requested_roles", [])
+    hosts = analysis.get("hosts", [])
+    if not requested_roles or not hosts:
+        return ""
+
+    lines = ["=== ROLE SCOPE CONTEXT ==="]
+    lines.append("Role-scoped request detected: " + ", ".join(requested_roles))
+    lines.append("Treat these role words as inventory scope, not as hostnames.")
+    lines.append("Matching inventory devices in scope:")
+    for index, hostname in enumerate(hosts[:8], start=1):
+        info = _device_info_for_host(hostname, device_cache)
+        role = str(info.get("device_role", "") or "").strip()
+        site = str(info.get("site", "") or "").strip()
+        tags = ", ".join(part for part in (role, site) if part)
+        if tags:
+            lines.append(f"{index}. {hostname} ({tags})")
+        else:
+            lines.append(f"{index}. {hostname}")
+    lines.append(
+        "For direct show/check/SSH requests on this role scope, gather evidence "
+        "for every matching device before stopping."
+    )
+    lines.append("================================")
+    return "\n".join(lines)
 
 
 def _extract_query_ips_and_prefixes(query: str) -> tuple[list[str], list[str]]:
@@ -529,11 +615,13 @@ def _build_compact_prompt(
     device_cache: dict,
     incident_context: str,
     user_query: str,
-) -> tuple[str, str]:
+) -> tuple[str, str, dict[str, Any]]:
+    role_scope_analysis = _analyze_role_scope(user_query, device_cache)
     analysis = _analyze_routing_inventory(user_query, device_cache)
     _prefill_routing_candidates(device_cache, analysis)
     cache_section = _build_cache_section(device_cache)
     prompt = SSH_COMPACT_PROMPT.format(device_cache_section=cache_section)
+    role_scope_context = _build_role_scope_section(role_scope_analysis, device_cache)
     routing_context = _build_routing_context_section(analysis, device_cache)
 
     sections: list[str] = []
@@ -552,10 +640,12 @@ def _build_compact_prompt(
             "The automated AIOps pipeline may also be running commands on the same device — "
             "your commands will queue safely behind any in-flight pipeline work."
         )
+    if role_scope_context:
+        sections.append(role_scope_context)
     if routing_context:
         sections.append(routing_context)
     sections.append(prompt)
-    return "\n\n".join(sections), cache_section
+    return "\n\n".join(sections), cache_section, role_scope_analysis
 
 
 def _find_user_query(messages: list[BaseMessage]) -> str:
@@ -1070,7 +1160,7 @@ def _execute_run_cli_batch(
 
         if command_sig in executed_calls:
             output = (
-                f"[BLOCKED] Command '{command}' was already executed on '{host}' "
+                f"[BLOCKED] Command '{signature_detail}' was already executed on '{host}' "
                 "in this turn. Do not repeat the same command without new evidence."
             )
             tool_metadata["tool_status"] = "blocked"
@@ -1166,10 +1256,15 @@ def free_run_node(
     incident_context: str = state.get("incident_context", "") or ""
     user_query = _find_user_query(messages)
 
-    compact_prompt, cache_section = _build_compact_prompt(
+    compact_prompt, cache_section, role_scope_analysis = _build_compact_prompt(
         device_cache=device_cache,
         incident_context=incident_context,
         user_query=user_query,
+    )
+    requested_role_scope_hosts = list(role_scope_analysis.get("hosts", []))
+    requires_role_scope_coverage = (
+        len(requested_role_scope_hosts) > 1
+        and bool(_ROLE_SCOPE_DIRECT_CHECK_RE.search(user_query or ""))
     )
     compact_system_msg = SystemMessage(content=compact_prompt)
     # Synthesis prompt is built lazily only when tools were executed (see below)
@@ -1287,6 +1382,33 @@ def free_run_node(
                         )
                     )
                     continue
+            if has_executed_tools and requires_role_scope_coverage:
+                missing_role_scope_hosts = _missing_requested_scope_hosts(
+                    requested_role_scope_hosts,
+                    prior_tool_messages,
+                    result_messages,
+                )
+                if missing_role_scope_hosts:
+                    missing_text = ", ".join(missing_role_scope_hosts[:6])
+                    if len(missing_role_scope_hosts) > 6:
+                        missing_text += ", ..."
+                    role_text = ", ".join(role_scope_analysis.get("requested_roles", []))
+                    loop_messages.append(
+                        HumanMessage(
+                            content=(
+                                "[System: Scope reminder]\n"
+                                "The user asked for a role-scoped check, so you "
+                                "must cover every device in that requested role scope "
+                                "before stopping.\n"
+                                f"Requested role scope: {role_text}\n"
+                                f"Devices still without direct execution evidence: {missing_text}\n"
+                                "Continue gathering the same kind of evidence for the "
+                                "remaining in-scope devices, or explain from evidence "
+                                "why a device truly does not need that check."
+                            )
+                        )
+                    )
+                    continue
             if (
                 has_executed_tools
                 and _requires_logical_topology(user_query)
@@ -1345,6 +1467,35 @@ def free_run_node(
         iteration_terminal = True
         has_executed_tools = True
 
+        preloaded_tool_results_by_id: dict[str, tuple[str, dict[str, Any]]] = {}
+        for tc in response.tool_calls:
+            tool_name = tc["name"]
+            if tool_name == "lookup_device":
+                tool_metadata = {"tool_args": tc.get("args", {})}
+                lookup_target = str(tc.get("args", {}).get("hostname", "") or "").strip()
+                role_matches = _resolve_role_scope_records(lookup_target)
+                if role_matches:
+                    output = json.dumps(role_matches)
+                    _update_cache_from_lookup_result(device_cache, output)
+                    latest_grounded_host = str(
+                        role_matches[0].get("hostname", "") or latest_grounded_host
+                    )
+                else:
+                    output = lookup_device.invoke(tc["args"])
+                    _update_cache_from_lookup_result(device_cache, output)
+                    try:
+                        data = json.loads(output)
+                        if isinstance(data, dict) and "hostname" in data and "error" not in data:
+                            latest_grounded_host = data["hostname"]
+                    except json.JSONDecodeError:
+                        pass
+                preloaded_tool_results_by_id[tc["id"]] = (output, tool_metadata)
+            elif tool_name == "list_all_devices":
+                tool_metadata = {"tool_args": tc.get("args", {})}
+                output = list_all_devices.invoke(tc["args"])
+                _update_cache_from_lookup_result(device_cache, output)
+                preloaded_tool_results_by_id[tc["id"]] = (output, tool_metadata)
+
         execution_calls = [
             tc for tc in response.tool_calls
             if tc["name"] in _EXECUTION_TOOL_NAMES
@@ -1371,19 +1522,9 @@ def free_run_node(
 
         for tc in response.tool_calls:
             if tc["name"] == "lookup_device":
-                tool_metadata = {"tool_args": tc.get("args", {})}
-                output = lookup_device.invoke(tc["args"])
-                _update_cache_from_lookup_result(device_cache, output)
-                try:
-                    data = json.loads(output)
-                    if isinstance(data, dict) and "hostname" in data and "error" not in data:
-                        latest_grounded_host = data["hostname"]
-                except json.JSONDecodeError:
-                    pass
+                output, tool_metadata = preloaded_tool_results_by_id[tc["id"]]
             elif tc["name"] == "list_all_devices":
-                tool_metadata = {"tool_args": tc.get("args", {})}
-                output = list_all_devices.invoke(tc["args"])
-                _update_cache_from_lookup_result(device_cache, output)
+                output, tool_metadata = preloaded_tool_results_by_id[tc["id"]]
             elif tc["name"] in _EXECUTION_TOOL_NAMES:
                 args = dict(tc["args"])
                 host = str(args.get("host", "") or "").strip()
@@ -1421,7 +1562,7 @@ def free_run_node(
         # without having to parse old tool-result messages.
         new_cache_section = _build_cache_section(device_cache)
         if new_cache_section != cache_section:
-            compact_prompt, cache_section = _build_compact_prompt(
+            compact_prompt, cache_section, role_scope_analysis = _build_compact_prompt(
                 device_cache=device_cache,
                 incident_context=incident_context,
                 user_query=user_query,
@@ -2459,6 +2600,18 @@ def _missing_run_cli_hosts(
         if item["host"] and item["host"] != "unknown"
     }
     return sorted(host for host in device_cache if host not in attempted_hosts)
+
+
+def _missing_requested_scope_hosts(
+    requested_hosts: list[str],
+    *message_groups: list[BaseMessage],
+) -> list[str]:
+    attempted_hosts = {
+        item["host"]
+        for item in _extract_run_cli_items(*message_groups)
+        if item["host"] and item["host"] != "unknown"
+    }
+    return sorted(host for host in requested_hosts if host not in attempted_hosts)
 
 
 def _missing_logical_hosts(

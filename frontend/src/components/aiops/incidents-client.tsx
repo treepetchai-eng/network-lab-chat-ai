@@ -13,8 +13,7 @@ const PAGE_SIZE = 20;
 const POLL_INTERVAL = 30_000;
 
 const STATUS_OPTIONS = [
-  "all","new","triaged","investigating","active","recovering",
-  "monitoring","awaiting_approval","approved","executing","verifying","escalated","reopened",
+  "all","active","recovering","monitoring",
 ] as const;
 const SEVERITY_OPTIONS = ["all","critical","warning","info"] as const;
 
@@ -28,6 +27,16 @@ const SEV_ROW: Record<string, string> = {
   warning:  "border-l-amber-500",
   info:     "border-l-sky-500/50",
 };
+
+function showWorkflowBadge(phase: string | null | undefined) {
+  return [
+    "ai_investigating",
+    "intent_confirmation_required",
+    "remediation_available",
+    "escalated_physical",
+    "escalated_external",
+  ].includes(phase ?? "none");
+}
 
 function sortIncidents(list: AIOpsIncident[], field: SortField, dir: SortDir) {
   return [...list].sort((a, b) => {
@@ -207,10 +216,20 @@ export function IncidentsClient({ initialIncidents }: { initialIncidents: AIOpsI
                         {inc.summary && (
                           <p className="mt-0.5 max-w-lg truncate text-[0.75rem] text-slate-500">{inc.summary}</p>
                         )}
+                        {(inc.child_count ?? 0) > 0 ? (
+                          <p className="mt-1 text-[0.68rem] text-slate-600">
+                            {(inc.active_child_count ?? 0)} open / {inc.child_count} related incident{(inc.child_count ?? 0) !== 1 ? "s" : ""}
+                          </p>
+                        ) : null}
                       </Link>
                     </td>
                     <td className="px-4 py-3"><StatusBadge value={inc.severity} showDot /></td>
-                    <td className="px-4 py-3"><StatusBadge value={inc.status} /></td>
+                    <td className="px-4 py-3">
+                      <div className="flex flex-col items-start gap-1">
+                        <StatusBadge value={inc.status} />
+                        {showWorkflowBadge(inc.workflow_phase) ? <StatusBadge value={inc.workflow_phase} /> : null}
+                      </div>
+                    </td>
                     <td className="px-4 py-3 font-mono text-[0.78rem] text-slate-400">{inc.primary_hostname ?? inc.primary_source_ip}</td>
                     <td className="hidden px-4 py-3 text-[0.78rem] text-slate-500 xl:table-cell">{inc.event_family}</td>
                     <td className="px-4 py-3 text-center text-[0.78rem] text-slate-500">{inc.event_count}</td>

@@ -99,6 +99,7 @@ def _incident_context(incident: dict[str, Any]) -> dict[str, Any]:
         "incident_no": incident.get("incident_no", ""),
         "title": incident.get("title", ""),
         "status": incident.get("status", ""),
+        "workflow_phase": incident.get("workflow_phase", ""),
         "severity": incident.get("severity", ""),
         "event_family": incident.get("event_family", ""),
         "primary_source_ip": incident.get("primary_source_ip", ""),
@@ -110,15 +111,21 @@ def _incident_context(incident: dict[str, Any]) -> dict[str, Any]:
         "event_count": incident.get("event_count", 0),
         "current_recovery_state": incident.get("current_recovery_state", ""),
         "category": incident.get("category", ""),
+        "metadata": incident.get("metadata") or {},
     }
 
 
 def _incident_context_text(incident: dict[str, Any]) -> str:
     context = _incident_context(incident)
+    metadata = context.get("metadata") or {}
+    cause_hint = metadata.get("cause_hint", "")
+    intent_status = metadata.get("intent_status", "")
+    link_id = metadata.get("link_id", "")
     return (
         f"incident_no={context['incident_no']}, "
         f"title={context['title']}, "
         f"status={context['status']}, "
+        f"workflow_phase={context['workflow_phase']}, "
         f"severity={context['severity']}, "
         f"family={context['event_family']}, "
         f"device={context['primary_hostname'] or context['primary_source_ip']}, "
@@ -127,7 +134,10 @@ def _incident_context_text(incident: dict[str, Any]) -> str:
         f"platform={context['os_platform']}, "
         f"version={context['version']}, "
         f"event_count={context['event_count']}, "
-        f"recovery_state={context['current_recovery_state']}"
+        f"recovery_state={context['current_recovery_state']}, "
+        f"cause_hint={cause_hint}, "
+        f"intent_status={intent_status}, "
+        f"link_id={link_id}"
     )
 
 
@@ -203,6 +213,9 @@ def _fallback_summary(incident: dict[str, Any]) -> dict[str, Any]:
 
 
 def _engineer_confidence(incident: dict[str, Any]) -> float:
+    metadata = incident.get("metadata") or {}
+    if metadata.get("cause_hint") == "linked_admin_down":
+        return 0.9
     if incident["event_family"] in {"bgp", "ospf", "eigrp", "tunnel", "tracking"}:
         return 0.67
     if incident["event_family"] == "interface":
@@ -217,6 +230,17 @@ def _engineer_summary(incident: dict[str, Any]) -> str:
     title = incident["title"]
     peer = _extract_bgp_peer(incident)
     monitoring_note = _monitoring_rationale(incident)
+    metadata = incident.get("metadata") or {}
+    if metadata.get("cause_hint") == "linked_admin_down":
+        root_host = metadata.get("root_host") or "the linked peer"
+        root_interface = metadata.get("root_interface") or "the linked interface"
+        remote_host = metadata.get("remote_host") or source
+        remote_interface = metadata.get("remote_interface") or "the impacted interface"
+        return (
+            f"Symptoms on {remote_host} {remote_interface} align with an admin shutdown on "
+            f"{root_host} {root_interface}. The system is holding the incident open until an engineer confirms "
+            "whether that shutdown was intentional, instead of treating the remote side as an independent physical fault."
+        )
     if family == "bgp":
         base = (
             f"BGP adjacency toward {peer} on {source} dropped and the incident now aggregates {event_count} related control-plane event(s). "
@@ -251,6 +275,14 @@ def _engineer_summary(incident: dict[str, Any]) -> str:
 def _engineer_cause(incident: dict[str, Any]) -> str:
     family = incident["event_family"]
     peer = _extract_bgp_peer(incident)
+    metadata = incident.get("metadata") or {}
+    if metadata.get("cause_hint") == "linked_admin_down":
+        root_host = metadata.get("root_host") or "the linked peer"
+        root_interface = metadata.get("root_interface") or "the linked interface"
+        return (
+            f"The leading hypothesis is peer-induced impact from an operator-triggered shutdown on "
+            f"{root_host} {root_interface}, so remediation should remain approval-gated until intent is confirmed."
+        )
     if family == "bgp":
         if peer:
             return f"The leading hypothesis is loss of BGP establishment toward peer {peer}, likely due to transport reachability degradation, session reset, policy mismatch, or peer-side instability."
@@ -270,6 +302,14 @@ def _engineer_impact(incident: dict[str, Any]) -> str:
     family = incident["event_family"]
     source = incident.get("primary_hostname") or incident["primary_source_ip"]
     status = incident.get("status", "")
+    metadata = incident.get("metadata") or {}
+    if metadata.get("cause_hint") == "linked_admin_down":
+        root_host = metadata.get("root_host") or "the linked peer"
+        root_interface = metadata.get("root_interface") or "the linked interface"
+        return (
+            f"Services traversing the path behind {root_host} {root_interface} may be impaired until the shutdown intent "
+            "is confirmed and, if needed, the link is restored."
+        )
     if family == "bgp":
         suffix = " The incident is currently in monitoring, so route exchange may already be back but still needs stability validation." if status == "monitoring" else ""
         return f"{source} may have lost external or inter-domain route exchange, which can affect reachability, path preference, and upstream convergence.{suffix}"
@@ -286,6 +326,15 @@ def _engineer_checks(incident: dict[str, Any]) -> list[str]:
     family = incident["event_family"]
     source = incident.get("primary_hostname") or incident["primary_source_ip"]
     peer = _extract_bgp_peer(incident)
+    metadata = incident.get("metadata") or {}
+    if metadata.get("cause_hint") == "linked_admin_down":
+        root_host = metadata.get("root_host") or "the linked peer"
+        root_interface = metadata.get("root_interface") or "the linked interface"
+        return [
+            f"Confirm with the operator or change record whether the shutdown on {root_host} {root_interface} was intentional.",
+            "Do not generate a no shutdown change until that intent confirmation is explicit.",
+            "If the shutdown was unintended, create an approval-gated remediation for the root interface and verify service recovery afterward.",
+        ]
     if family == "bgp":
         return [
             f"On {source}, check `show ip bgp summary` and verify the neighbor state, uptime, and reset counters{f' for peer {peer}' if peer else ''}.",
@@ -509,6 +558,8 @@ def generate_ai_summary(incident: dict[str, Any], logs: list[dict[str, Any]]) ->
                             "Make the summary technically specific, concise, and operationally useful. "
                             "When possible, mention the concrete peer, interface, tunnel, or tracked object seen in the logs. "
                             "If the incident status is monitoring or recovering, say why the incident is still open instead of describing it as a fresh outage. "
+                            "If incident metadata says cause_hint=linked_admin_down or intent_status=needs_confirmation, "
+                            "treat it as config-related peer-induced impact and do not label it as a physical fault by default. "
                             "Do not repeat the same sentence structure across summary, cause, and impact. "
                             "The probable_cause should read like a disciplined working hypothesis, not a guess. "
                             "The impact must describe likely blast radius in engineer language. "
@@ -654,17 +705,20 @@ def run_llm_troubleshoot(
                 "description 'UNUSED' or 'TEST' → negligible impact. "
                 "Always mention the interface description in your summary when it is available.\n\n"
                 "Apply these rules IN ORDER to the CLI evidence above:\n"
-                "0. Check the interface description FIRST (from 'show interfaces description' output).\n"
+                "0. If the incident context includes cause_hint=linked_admin_down or intent_status=needs_confirmation, "
+                "disposition = needs_human_review. Explain that a human must confirm whether the linked admin shutdown "
+                "was intentional before any no shutdown proposal can be generated.\n"
+                "1. Check the interface description FIRST (from 'show interfaces description' output).\n"
                 "   If the affected interface has a description indicating it is intentionally inactive — "
                 "e.g. 'unused', 'spare', 'decommissioned', 'decomm', 'do not use', 'dnu', 'not in use', "
                 "'disabled', 'reserved', 'test port' — then disposition = no_action_needed. "
                 "This overrides all other rules. The port is intentionally down; no fix is required.\n"
-                "1. If ANY interface shows 'administratively down' AND its description does NOT indicate intentional inactivity → disposition = config_fix_possible\n"
+                "2. If ANY interface shows 'administratively down' AND its description does NOT indicate intentional inactivity → disposition = config_fix_possible\n"
                 "   Fix: ['interface <intf>', 'no shutdown']  Rollback: ['interface <intf>', 'shutdown']\n"
-                "2. If interface is 'down, line protocol is down' (no 'administratively') → disposition = physical_issue\n"
-                "3. If interface/neighbor is currently UP in CLI but syslog showed it down earlier → disposition = self_recovered\n"
-                "4. If routing neighbor is missing but interface is up/up → disposition = monitor_further\n"
-                "5. Only use needs_human_review if the evidence is genuinely contradictory or missing.\n\n"
+                "3. If interface is 'down, line protocol is down' (no 'administratively') → disposition = physical_issue\n"
+                "4. If interface/neighbor is currently UP in CLI but syslog showed it down earlier → disposition = self_recovered\n"
+                "5. If routing neighbor is missing but interface is up/up → disposition = monitor_further\n"
+                "6. Only use needs_human_review if the evidence is genuinely contradictory or missing.\n\n"
                 "Return ONLY strict JSON with keys:\n"
                 "disposition, summary, conclusion,\n"
                 "proposed_fix_title, proposed_fix_rationale,\n"

@@ -144,3 +144,13 @@ export function submitRecoveryDecision(
     body: JSON.stringify(payload),
   });
 }
+
+export function confirmIncidentIntent(
+  incidentNo: string,
+  payload: { intent: "intentional" | "unintentional"; note: string; actor?: string },
+): Promise<AIOpsIncidentDetailPayload> {
+  return fetchAIOps(`/api/aiops/incidents/${incidentNo}/intent`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}

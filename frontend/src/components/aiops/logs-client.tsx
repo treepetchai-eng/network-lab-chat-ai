@@ -142,8 +142,10 @@ function RawLogsTab({ logs, incidentFilter }: { logs: AIOpsRawLog[]; incidentFil
                       </span>
                     </td>
                     <td className="px-4 py-2.5 font-mono text-[0.72rem] text-slate-400 whitespace-nowrap">
-                      <div>{log.source_ip}</div>
-                      {log.hostname && <div className="text-slate-600">{log.hostname}</div>}
+                      <div>{log.hostname || log.source_ip}</div>
+                      {log.hostname && log.hostname !== log.source_ip && (
+                        <div className="text-slate-600">{log.source_ip}</div>
+                      )}
                     </td>
                     <td className="px-4 py-2.5 whitespace-nowrap">
                       <StatusBadge value={log.parse_status} />

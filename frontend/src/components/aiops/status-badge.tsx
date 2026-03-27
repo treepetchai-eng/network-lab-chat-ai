@@ -17,6 +17,13 @@ const LABELS: Record<string, string> = {
   resolved:          "Resolved",
   closed:            "Closed",
   triaged:           "Triaged",
+  ai_investigating: "AI Investigating",
+  intent_confirmation_required: "Intent Confirmation",
+  remediation_available: "Remediation Available",
+  approved_to_execute: "Approved to Execute",
+  awaiting_verification: "Awaiting Verification",
+  escalated_physical: "Escalated Physical",
+  escalated_external: "Escalated External",
   // Severity
   critical:          "Critical",
   warning:           "Warning",
@@ -54,16 +61,23 @@ const STYLES: Record<string, string> = {
   // Phase 2 – Analysis
   triaged:           "border-cyan-500/30   bg-cyan-500/10   text-cyan-300",
   investigating:     "border-indigo-500/30 bg-indigo-500/10 text-indigo-300",
+  ai_investigating:  "border-indigo-500/30 bg-indigo-500/10 text-indigo-300",
 
   // Phase 3 – Open / Needs action
   active:            "border-rose-500/30   bg-rose-500/10   text-rose-300",
   escalated:         "border-orange-500/30 bg-orange-500/10 text-orange-300",
+  remediation_available: "border-fuchsia-500/30 bg-fuchsia-500/10 text-fuchsia-300",
+  approved_to_execute: "border-violet-500/30 bg-violet-500/10 text-violet-300",
+  intent_confirmation_required: "border-amber-500/30 bg-amber-500/10 text-amber-300",
+  escalated_physical: "border-orange-500/30 bg-orange-500/10 text-orange-300",
+  escalated_external: "border-slate-500/30 bg-slate-500/10 text-slate-300",
 
   // Phase 4 – Remediation gate
   awaiting_approval: "border-fuchsia-500/30 bg-fuchsia-500/10 text-fuchsia-300",
   approved:          "border-violet-500/30  bg-violet-500/10  text-violet-300",
   executing:         "border-orange-500/30  bg-orange-500/10  text-orange-300",
   verifying:         "border-cyan-500/30    bg-cyan-500/10    text-cyan-300",
+  awaiting_verification: "border-cyan-500/30 bg-cyan-500/10 text-cyan-300",
 
   // Phase 5 – Recovery watch
   recovering:        "border-amber-500/30  bg-amber-500/10  text-amber-300",
@@ -116,6 +130,13 @@ const DOTS: Record<string, string> = {
   new:        "bg-sky-400",
   investigating: "bg-indigo-400",
   awaiting_approval: "bg-fuchsia-400",
+  ai_investigating: "bg-indigo-400",
+  remediation_available: "bg-fuchsia-400",
+  approved_to_execute: "bg-violet-400",
+  intent_confirmation_required: "bg-amber-400",
+  awaiting_verification: "bg-cyan-400",
+  escalated_physical: "bg-orange-400",
+  escalated_external: "bg-slate-400",
   down:       "bg-rose-400",
   up:         "bg-emerald-400",
 };

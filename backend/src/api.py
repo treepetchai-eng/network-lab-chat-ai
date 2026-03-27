@@ -235,6 +235,12 @@ class RecoveryDecisionRequest(BaseModel):
     note: str = Field(..., min_length=1, max_length=1000)
 
 
+class IntentDecisionRequest(BaseModel):
+    intent: str = Field(..., pattern="^(intentional|unintentional)$")
+    note: str = Field(..., min_length=1, max_length=1000)
+    actor: str | None = Field(default=None, max_length=120)
+
+
 class AIOpsResetResponse(BaseModel):
     incidents_removed: int
     events_removed: int
@@ -712,3 +718,19 @@ async def aiops_verify_endpoint(incident_no: str, req: RecoveryDecisionRequest):
         return _aiops_service.verify_recovery(incident_no, healed=req.healed, note=req.note)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/aiops/incidents/{incident_no}/intent")
+async def aiops_intent_endpoint(incident_no: str, req: IntentDecisionRequest):
+    _ensure_aiops_ready()
+    try:
+        return _aiops_service.confirm_incident_intent(
+            incident_no,
+            intent=req.intent,
+            note=req.note,
+            actor=req.actor,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc

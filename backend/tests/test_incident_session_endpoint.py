@@ -22,7 +22,8 @@ def test_create_incident_session_preloads_context_and_device_cache(monkeypatch):
         "incident": {
             "incident_no": incident_no,
             "severity": "p2",
-            "status": "investigating",
+            "status": "active",
+            "workflow_phase": "none",
             "title": "BGP adjacency down on HQ core",
             "primary_hostname": "HQ-CORE-RT01",
             "primary_source_ip": "10.255.1.11",

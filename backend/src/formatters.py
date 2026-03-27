@@ -124,6 +124,24 @@ def fmt_lookup(raw: str) -> str:
     except Exception:
         return f"```\n{raw}\n```"
 
+    if isinstance(data, list):
+        if not data:
+            return "No matching devices found."
+        role = str(data[0].get("device_role", "") or "").strip() or "requested role"
+        lines = [
+            "Role Scope Resolved",
+            "",
+            f"Matched devices for `{role}`:",
+        ]
+        for item in data[:8]:
+            hostname = item.get("hostname", "?")
+            ip = item.get("ip_address", "?")
+            site = item.get("site", "?")
+            lines.append(f"- {hostname} (`{ip}`) [{site}]")
+        if len(data) > 8:
+            lines.append(f"- ... and {len(data) - 8} more")
+        return "\n".join(lines)
+
     if "error" in data:
         sugg = data.get("suggestions", [])
         candidates = data.get("candidates", [])

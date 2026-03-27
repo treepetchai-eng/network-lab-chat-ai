@@ -5,9 +5,9 @@ import { Network, Cpu, ShieldCheck, Route, Search, Wifi } from "lucide-react";
 
 const SUGGESTIONS = [
   { icon: Search,      text: "List all devices in inventory" },
-  { icon: Route,       text: "Show BGP summary on core_router" },
-  { icon: Cpu,         text: "Check interface status on dist_switch" },
-  { icon: ShieldCheck, text: "Is core_router reachable via SSH?" },
+  { icon: Route,       text: "Show BGP summary on all core routers" },
+  { icon: Cpu,         text: "Check interface status on all distribution switches" },
+  { icon: ShieldCheck, text: "Is every core router reachable via SSH?" },
 ];
 
 interface WelcomeScreenProps {

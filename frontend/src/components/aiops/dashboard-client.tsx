@@ -37,6 +37,16 @@ const SEVERITY_BORDER: Record<string, string> = {
   info:     "border-l-sky-500/60",
 };
 
+function showWorkflowBadge(phase: string | null | undefined) {
+  return [
+    "ai_investigating",
+    "intent_confirmation_required",
+    "remediation_available",
+    "escalated_physical",
+    "escalated_external",
+  ].includes(phase ?? "none");
+}
+
 interface Props {
   initialDashboard: AIOpsDashboardPayload;
   initialLogs: AIOpsLogsPayload;
@@ -86,11 +96,9 @@ export function DashboardClient({ initialDashboard, initialLogs }: Props) {
         <p className="mb-2.5 text-[0.65rem] font-semibold uppercase tracking-widest text-slate-600">Incident Lifecycle</p>
         <div className="flex flex-wrap items-center gap-1.5 text-[0.7rem]">
           {([
-            { label: "New",            color: "text-sky-300",      bg: "bg-sky-500/10 border-sky-500/20" },
-            { label: "Investigating",  color: "text-indigo-300",   bg: "bg-indigo-500/10 border-indigo-500/20" },
             { label: "Active",         color: "text-rose-300",     bg: "bg-rose-500/10 border-rose-500/20" },
-            { label: "Needs Approval", color: "text-fuchsia-300",  bg: "bg-fuchsia-500/10 border-fuchsia-500/20" },
             { label: "Recovering",     color: "text-amber-300",    bg: "bg-amber-500/10 border-amber-500/20" },
+            { label: "Monitoring",     color: "text-yellow-300",   bg: "bg-yellow-500/10 border-yellow-500/20" },
             { label: "Resolved →",     color: "text-emerald-300",  bg: "bg-emerald-500/10 border-emerald-500/20" },
             { label: "History",        color: "text-slate-400",    bg: "bg-slate-500/10 border-slate-500/20" },
           ] as const).map(({ label, color, bg }, i, arr) => (
@@ -102,7 +110,7 @@ export function DashboardClient({ initialDashboard, initialLogs }: Props) {
               {i === arr.length - 2 && null}
             </span>
           ))}
-          <span className="ml-2 text-slate-600">· Escalated = Physical/External (stays active until manually resolved)</span>
+          <span className="ml-2 text-slate-600">· Related incidents and remediation hints appear as secondary context, not as the primary health status</span>
         </div>
       </div>
 
@@ -189,9 +197,17 @@ export function DashboardClient({ initialDashboard, initialLogs }: Props) {
                     <p className="mt-0.5 text-[0.76rem] text-slate-500">
                       {inc.primary_hostname ?? inc.primary_source_ip}
                     </p>
+                    {(inc.child_count ?? 0) > 0 ? (
+                      <p className="mt-1 text-[0.68rem] text-slate-600">
+                        {(inc.active_child_count ?? 0)} open / {inc.child_count} related incident{(inc.child_count ?? 0) !== 1 ? "s" : ""}
+                      </p>
+                    ) : null}
                   </div>
                   <div className="shrink-0 text-right">
-                    <StatusBadge value={inc.status} />
+                    <div className="flex flex-col items-end gap-1">
+                      <StatusBadge value={inc.status} />
+                      {showWorkflowBadge(inc.workflow_phase) ? <StatusBadge value={inc.workflow_phase} /> : null}
+                    </div>
                     <p className="mt-1 text-[0.68rem] text-slate-600">{relativeTime(inc.last_seen_at)}</p>
                   </div>
                 </Link>

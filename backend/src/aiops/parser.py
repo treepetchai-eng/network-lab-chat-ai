@@ -376,7 +376,7 @@ def parse_syslog(
     """Parse a single syslog line.
 
     Returns a structured event dict, or None for lines that should be silently
-    discarded (noise, boot banners, admin-initiated shutdowns).
+    discarded (noise, boot banners).
     """
     cleaned = _strip_syslog_prefix(raw_message)
 
@@ -407,10 +407,6 @@ def parse_syslog(
 
     # ── State / severity detection ───────────────────────────────────────────
     state, severity = _detect_state(cleaned, cisco_severity, mnemonic)
-
-    # ── Suppress admin-down events (operator-initiated, no recovery needed) ──
-    if state == "admin_down":
-        return None
 
     # ── Extract interface and neighbor ───────────────────────────────────────
     interface_match = _INTERFACE_RE.search(cleaned)
@@ -461,6 +457,8 @@ def parse_syslog(
             "neighbor_ip":     neighbor_ip,
             "peer_ip":         peer_ip,
             "recovery_signal": state in _RECOVERY_STATES,
+            "operator_initiated_hint": state == "admin_down",
+            "eligible_for_standalone_incident": state != "admin_down",
             "cisco_facility":  cisco_facility,
             "cisco_severity":  cisco_severity,
             "mnemonic":        mnemonic,

@@ -177,6 +177,54 @@ class TestInterfaceInventoryResolvers:
         assert ("BRANCH-A-Switch", "Vlan99") in exact_matches
         assert ("BRANCH-A-RTR", "GigabitEthernet0/3.99") in exact_matches
 
+    def test_resolve_link_context_uses_unique_network_pair(self):
+        from src.tools.interface_inventory import resolve_link_context
+
+        context = resolve_link_context("HQ-CORE-RT01", "Gi0/0")
+
+        assert context["link_id"] == "HQ-CORE-RT01:GigabitEthernet0/0<->HQ-CORE-RT02:GigabitEthernet0/0"
+        assert context["local_interface"] == "GigabitEthernet0/0"
+        assert context["remote_hostname"] == "HQ-CORE-RT02"
+        assert context["remote_interface"] == "GigabitEthernet0/0"
+        assert context["remote_mgmt_ip"] == "10.255.1.12"
+        assert context["topology_confidence"] == "high"
+
+    def test_resolve_link_context_falls_back_to_description_hint(self):
+        from src.tools.interface_inventory import resolve_link_context
+
+        context = resolve_link_context("BRANCH-A-Switch", "GigabitEthernet0/1")
+
+        assert context["link_id"] == "BRANCH-A-RTR:GigabitEthernet0/3<->BRANCH-A-Switch:GigabitEthernet0/1"
+        assert context["remote_hostname"] == "BRANCH-A-RTR"
+        assert context["remote_interface"] == "GigabitEthernet0/3"
+        assert context["topology_confidence"] == "high"
+
+    def test_resolve_link_context_returns_empty_link_for_ambiguous_topology(self, monkeypatch):
+        from src.tools import interface_inventory as inventory_module
+
+        rows = [
+            {"hostname": "LAB-A", "interface_name": "GigabitEthernet0/0", "network_cidr": "10.0.0.0/24", "description": "", "mgmt_ip": "10.0.0.11", "ip_address": "10.0.0.1"},
+            {"hostname": "LAB-B", "interface_name": "GigabitEthernet0/0", "network_cidr": "10.0.0.0/24", "description": "", "mgmt_ip": "10.0.0.12", "ip_address": "10.0.0.2"},
+            {"hostname": "LAB-C", "interface_name": "GigabitEthernet0/0", "network_cidr": "10.0.0.0/24", "description": "", "mgmt_ip": "10.0.0.13", "ip_address": "10.0.0.3"},
+        ]
+        index = {
+            "by_hostname": {
+                "lab-a": [rows[0]],
+                "lab-b": [rows[1]],
+                "lab-c": [rows[2]],
+            },
+            "by_ip": {},
+            "by_network": {"10.0.0.0/24": rows},
+            "network_entries": [],
+        }
+        monkeypatch.setattr(inventory_module, "_load_interface_rows", lambda *, full=False: (rows, index))
+
+        context = inventory_module.resolve_link_context("LAB-A", "GigabitEthernet0/0")
+
+        assert context["link_id"] == ""
+        assert context["local_interface"] == "GigabitEthernet0/0"
+        assert context["remote_hostname"] == ""
+
 
 class TestPromptCoverage:
     def test_full_prompt_matches_free_run_architecture(self):
@@ -250,6 +298,33 @@ class TestFormatters:
         assert "Resolved via: interface IP 10.255.10.14" in rendered
         assert "Matched Interface: GigabitEthernet0/1" in rendered
         assert "Interface Network: 10.255.10.12/30" in rendered
+
+    def test_fmt_lookup_renders_role_scope_resolution(self):
+        from src.formatters import fmt_lookup
+
+        raw = json.dumps([
+            {
+                "hostname": "HQ-CORE-RT01",
+                "ip_address": "10.255.1.11",
+                "os_platform": "cisco_ios",
+                "device_role": "core_router",
+                "site": "HQ",
+                "version": "15.6(2)T",
+            },
+            {
+                "hostname": "HQ-CORE-RT02",
+                "ip_address": "10.255.1.12",
+                "os_platform": "cisco_ios",
+                "device_role": "core_router",
+                "site": "HQ",
+                "version": "15.6(2)T",
+            },
+        ])
+
+        rendered = fmt_lookup(raw)
+        assert "Role Scope Resolved" in rendered
+        assert "HQ-CORE-RT01" in rendered
+        assert "HQ-CORE-RT02" in rendered
 
     def test_parse_output_handles_command_repair_prefix(self):
         from src.formatters import parse_output

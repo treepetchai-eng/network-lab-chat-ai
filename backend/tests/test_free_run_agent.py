@@ -211,6 +211,7 @@ def test_ssh_compact_prompt_preserves_topology_scope_guidance():
     from src.prompts.ssh_compact import SSH_COMPACT_PROMPT
 
     assert '"all devices" / "ทุกตัว" → list_all_devices first' in SSH_COMPACT_PROMPT
+    assert "role words like `core_router`, `dist_switch`, `router`, `access_switch` refer to" in SSH_COMPACT_PROMPT.lower()
     assert "topology / relationships / dependencies across all devices" in SSH_COMPACT_PROMPT
     assert "do not stop after checking only a subset" in SSH_COMPACT_PROMPT
     assert "gather at least one logical" in SSH_COMPACT_PROMPT
@@ -1162,6 +1163,169 @@ def test_execute_run_cli_batch_runs_calls_concurrently_and_preserves_order():
     assert [item["tc"]["id"] for item in results] == ["call-1", "call-2"]
     assert results[0]["tool_metadata"]["tool_status"] == "success"
     assert results[1]["tool_metadata"]["tool_status"] == "success"
+
+
+def test_execute_run_cli_batch_blocks_duplicate_command_without_name_error():
+    from src.graph.agents.free_run_agent import _execute_run_cli_batch
+
+    class DummyRunCliTool:
+        def invoke(self, _args):
+            raise AssertionError("duplicate command should be blocked before execution")
+
+    results = _execute_run_cli_batch(
+        [
+            {
+                "name": "run_cli",
+                "args": {"host": "R1", "command": "show ip bgp summary"},
+                "id": "call-2",
+            }
+        ],
+        run_cli_tool=DummyRunCliTool(),
+        executed_calls={("R1", "show ip bgp summary")},
+        terminal_failures=set(),
+    )
+
+    assert len(results) == 1
+    assert results[0]["tool_metadata"]["tool_status"] == "blocked"
+    assert "show ip bgp summary" in results[0]["output"]
+    assert "already executed on 'R1'" in results[0]["output"]
+
+
+def test_free_run_node_updates_inventory_cache_before_same_turn_run_cli():
+    from src.graph.agents.free_run_agent import free_run_node
+    from src.tools.cli_tool import create_run_cli_tool
+    from src.tools import cli_tool as cli_tool_module
+
+    class DummyLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def bind_tools(self, _tools):
+            return self
+
+        def invoke(self, _messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "lookup_device",
+                            "args": {"hostname": "HQ-CORE-RT01"},
+                            "id": "call-1",
+                        },
+                        {
+                            "name": "run_cli",
+                            "args": {"host": "HQ-CORE-RT01", "command": "show ip bgp summary"},
+                            "id": "call-2",
+                        },
+                    ],
+                )
+            return AIMessage(content="summary", tool_calls=[])
+
+    class DummyAnswerLLM:
+        def invoke(self, _messages):
+            return AIMessage(content="summary")
+
+    device_cache = {}
+    run_cli_tool = create_run_cli_tool(device_cache)
+
+    original_execute_cli = cli_tool_module.execute_cli
+    cli_tool_module.execute_cli = (
+        lambda ip, os_platform, command:
+        f"[Device: HQ-CORE-RT01 | IP: {ip} | OS: {os_platform}]\noutput for {command}"
+    )
+    try:
+        result = free_run_node(
+            {
+                "messages": [HumanMessage(content="Show BGP summary on HQ-CORE-RT01")],
+                "device_cache": device_cache,
+            },
+            llm=DummyLLM(),
+            answer_llm=DummyAnswerLLM(),
+            run_cli_tool=run_cli_tool,
+        )
+    finally:
+        cli_tool_module.execute_cli = original_execute_cli
+
+    tool_messages = [
+        msg
+        for msg in result["messages"]
+        if isinstance(msg, ToolMessage) and getattr(msg, "name", "") == "run_cli"
+    ]
+    assert len(tool_messages) == 1
+    assert tool_messages[0].additional_kwargs["tool_status"] == "success"
+    assert "HQ-CORE-RT01" in tool_messages[0].content
+
+
+def test_free_run_node_treats_role_lookup_as_multi_device_scope_and_reminds_until_complete():
+    from src.graph.agents.free_run_agent import free_run_node
+
+    class DummyLLM:
+        def __init__(self):
+            self.calls = []
+
+        def bind_tools(self, _tools):
+            return self
+
+        def invoke(self, messages):
+            self.calls.append(messages)
+            call_no = len(self.calls)
+            if call_no == 1:
+                system_text = str(messages[0].content)
+                assert "Role-scoped request detected: core_router" in system_text
+                assert "HQ-CORE-RT01" in system_text
+                assert "HQ-CORE-RT02" in system_text
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"name": "lookup_device", "args": {"hostname": "core_router"}, "id": "call-1"},
+                        {"name": "run_cli", "args": {"host": "HQ-CORE-RT01", "command": "show ip bgp summary"}, "id": "call-2"},
+                    ],
+                )
+            if call_no == 2:
+                return AIMessage(content="summary so far", tool_calls=[])
+            reminder_texts = [str(m.content) for m in messages if hasattr(m, "content")]
+            assert any("Requested role scope: core_router" in text for text in reminder_texts)
+            assert any("HQ-CORE-RT02" in text for text in reminder_texts)
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "run_cli", "args": {"host": "HQ-CORE-RT02", "command": "show ip bgp summary"}, "id": "call-3"},
+                ],
+            )
+
+    class DummyRunCliTool:
+        def invoke(self, args):
+            return (
+                f"[Device: {args['host']} | IP: 10.0.0.1 | OS: cisco_ios]\n"
+                "Neighbor        V    AS MsgRcvd MsgSent TblVer InQ OutQ Up/Down  State/PfxRcd\n"
+                "10.0.0.2        4 64512      86      84      3   0    0 01:14:21 2\n"
+            )
+
+    class DummyAnswerLLM:
+        def invoke(self, _messages):
+            return AIMessage(content="checked both core routers")
+
+    result = free_run_node(
+        {
+            "messages": [HumanMessage(content="Show BGP summary on core_router")],
+            "device_cache": {},
+        },
+        llm=DummyLLM(),
+        answer_llm=DummyAnswerLLM(),
+        run_cli_tool=DummyRunCliTool(),
+    )
+
+    tool_messages = [
+        msg
+        for msg in result["messages"]
+        if isinstance(msg, ToolMessage) and getattr(msg, "name", "") == "run_cli"
+    ]
+    assert {msg.additional_kwargs["tool_args"]["host"] for msg in tool_messages} == {
+        "HQ-CORE-RT01",
+        "HQ-CORE-RT02",
+    }
 
 
 def test_summarize_show_version_condenses_verbose_output():

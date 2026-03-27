@@ -27,6 +27,23 @@ def _split_tunnel_ips(row: dict) -> list[str]:
     return [ip.strip() for ip in tunnel_ips_raw.split() if ip.strip()]
 
 
+def normalize_device_role(role: str) -> str:
+    """Normalize role text so query aliases match inventory values."""
+    return re.sub(r"[\s-]+", "_", (role or "").strip().lower())
+
+
+def resolve_inventory_role(role: str) -> list[dict]:
+    """Return all inventory records whose device role matches *role*."""
+    normalized = normalize_device_role(role)
+    if not normalized:
+        return []
+    return [
+        dict(row)
+        for row in _load_rows()
+        if normalize_device_role(str(row.get("device_role", "") or "")) == normalized
+    ]
+
+
 def _row_payload(row: dict) -> dict:
     return {
         "hostname":    row["hostname"],

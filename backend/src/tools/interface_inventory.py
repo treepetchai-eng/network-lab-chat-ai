@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import ipaddress
+import re
 from pathlib import Path
 from typing import Any
 
@@ -19,9 +20,183 @@ _EMPTY_INDEX = {
     "network_entries": [],
 }
 
+_INTERFACE_PREFIX_VARIANTS: tuple[tuple[str, ...], ...] = (
+    ("tengigabitethernet", "tengig", "te"),
+    ("gigabitethernet", "gi"),
+    ("fastethernet", "fa"),
+    ("ethernet", "eth"),
+    ("loopback", "lo"),
+    ("tunnel", "tu"),
+    ("port-channel", "po"),
+    ("vlan", "vl"),
+    ("serial", "se"),
+)
+_DESCRIPTION_LINK_RE = re.compile(
+    r"(?:TO-|TO\s+|UPLINK\s*->\s*)([A-Z0-9._-]+)\s+([A-Z][A-Z0-9/.-]+)",
+    re.IGNORECASE,
+)
+
 
 def _normalize_row(row: dict[str, str]) -> dict[str, str]:
     return {key: (value or "").strip() for key, value in row.items()}
+
+
+def _interface_aliases(interface_name: str) -> set[str]:
+    cleaned = (interface_name or "").strip().lower().replace(" ", "")
+    if not cleaned:
+        return set()
+
+    aliases = {cleaned}
+    for variants in _INTERFACE_PREFIX_VARIANTS:
+        for variant in variants:
+            if cleaned.startswith(variant):
+                suffix = cleaned[len(variant):]
+                aliases.update(f"{alt}{suffix}" for alt in variants)
+                return aliases
+    return aliases
+
+
+def _interface_matches(left: str, right: str) -> bool:
+    return bool(_interface_aliases(left) & _interface_aliases(right))
+
+
+def _description_link_hint(description: str) -> tuple[str, str] | None:
+    match = _DESCRIPTION_LINK_RE.search((description or "").strip())
+    if not match:
+        return None
+    return match.group(1).strip(), match.group(2).strip()
+
+
+def _build_link_id(local_row: dict[str, str], remote_row: dict[str, str]) -> str:
+    endpoints = sorted(
+        [
+            f"{local_row.get('hostname', '')}:{local_row.get('interface_name', '')}",
+            f"{remote_row.get('hostname', '')}:{remote_row.get('interface_name', '')}",
+        ],
+        key=str.lower,
+    )
+    return "<->".join(endpoints)
+
+
+def _link_context_response(
+    *,
+    hostname: str,
+    interface_name: str | None,
+    peer_ip: str | None,
+    local_row: dict[str, str] | None = None,
+    remote_row: dict[str, str] | None = None,
+    topology_confidence: str = "",
+    resolution_method: str = "",
+) -> dict[str, str]:
+    if not local_row or not remote_row:
+        return {
+            "query_host": hostname or "",
+            "query_interface": interface_name or "",
+            "query_peer_ip": peer_ip or "",
+            "link_id": "",
+            "local_interface": local_row.get("interface_name", "") if local_row else (interface_name or ""),
+            "remote_hostname": "",
+            "remote_interface": "",
+            "remote_mgmt_ip": "",
+            "topology_confidence": "",
+            "resolution_method": "",
+        }
+
+    return {
+        "query_host": hostname or "",
+        "query_interface": interface_name or "",
+        "query_peer_ip": peer_ip or "",
+        "link_id": _build_link_id(local_row, remote_row),
+        "local_interface": local_row.get("interface_name", ""),
+        "remote_hostname": remote_row.get("hostname", ""),
+        "remote_interface": remote_row.get("interface_name", ""),
+        "remote_mgmt_ip": remote_row.get("mgmt_ip", ""),
+        "topology_confidence": topology_confidence,
+        "resolution_method": resolution_method,
+    }
+
+
+def _resolve_local_row(
+    *,
+    host_rows: list[dict[str, str]],
+    interface_name: str | None,
+    peer_ip: str | None,
+) -> dict[str, str] | None:
+    if interface_name:
+        exact_matches = [
+            row for row in host_rows
+            if row.get("interface_name", "").strip().lower() == interface_name.strip().lower()
+        ]
+        if len(exact_matches) == 1:
+            return exact_matches[0]
+
+        alias_matches = [row for row in host_rows if _interface_matches(interface_name, row.get("interface_name", ""))]
+        if len(alias_matches) == 1:
+            return alias_matches[0]
+
+    if not peer_ip:
+        return None
+
+    try:
+        peer_ip_obj = ipaddress.ip_address(peer_ip)
+    except ValueError:
+        return None
+
+    matches: list[dict[str, str]] = []
+    for row in host_rows:
+        network_cidr = row.get("network_cidr", "")
+        if not network_cidr:
+            continue
+        try:
+            network = ipaddress.ip_network(network_cidr, strict=False)
+        except ValueError:
+            continue
+        if peer_ip_obj in network:
+            matches.append(row)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _resolve_remote_row_from_network(
+    *,
+    index: dict[str, Any],
+    local_row: dict[str, str],
+    peer_ip: str | None,
+) -> dict[str, str] | None:
+    network_cidr = local_row.get("network_cidr", "")
+    if not network_cidr:
+        return None
+
+    remote_candidates = [
+        row for row in index["by_network"].get(network_cidr, [])
+        if row.get("hostname", "").strip().lower() != local_row.get("hostname", "").strip().lower()
+    ]
+    if not remote_candidates:
+        return None
+
+    if peer_ip:
+        exact_peer = next((row for row in remote_candidates if row.get("ip_address", "") == peer_ip), None)
+        if exact_peer is not None:
+            return exact_peer
+
+    hostnames = {row.get("hostname", "").strip().lower() for row in index["by_network"].get(network_cidr, []) if row.get("hostname", "")}
+    if len(remote_candidates) == 1 and len(hostnames) == 2:
+        return remote_candidates[0]
+    return None
+
+
+def _resolve_remote_row_from_description(
+    *,
+    index: dict[str, Any],
+    local_row: dict[str, str],
+) -> dict[str, str] | None:
+    hint = _description_link_hint(local_row.get("description", ""))
+    if hint is None:
+        return None
+
+    remote_hostname, remote_interface_hint = hint
+    host_rows = index["by_hostname"].get(remote_hostname.lower(), [])
+    matches = [row for row in host_rows if _interface_matches(remote_interface_hint, row.get("interface_name", ""))]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _load_interface_rows(*, full: bool = False) -> tuple[list[dict[str, str]], dict[str, Any]]:
@@ -167,3 +342,56 @@ def resolve_prefix_context(prefix: str, *, full: bool = False) -> dict[str, Any]
         "exact_matches": exact_matches,
         "overlapping_matches": overlapping_matches,
     }
+
+
+def resolve_link_context(
+    hostname: str,
+    interface_name: str | None = None,
+    *,
+    peer_ip: str | None = None,
+    full: bool = False,
+) -> dict[str, str]:
+    """Resolve a device/interface or device/peer-IP to a deterministic inter-device link."""
+    search = (hostname or "").strip().lower()
+    if not search:
+        return _link_context_response(hostname="", interface_name=interface_name, peer_ip=peer_ip)
+
+    _rows, index = _load_interface_rows(full=full)
+    host_rows = index["by_hostname"].get(search, [])
+    if not host_rows:
+        return _link_context_response(hostname=hostname, interface_name=interface_name, peer_ip=peer_ip)
+
+    local_row = _resolve_local_row(host_rows=host_rows, interface_name=interface_name, peer_ip=peer_ip)
+    if local_row is None:
+        return _link_context_response(hostname=hostname, interface_name=interface_name, peer_ip=peer_ip)
+
+    remote_row = _resolve_remote_row_from_network(index=index, local_row=local_row, peer_ip=peer_ip)
+    if remote_row is not None:
+        return _link_context_response(
+            hostname=hostname,
+            interface_name=interface_name,
+            peer_ip=peer_ip,
+            local_row=local_row,
+            remote_row=remote_row,
+            topology_confidence="high",
+            resolution_method="network_cidr",
+        )
+
+    remote_row = _resolve_remote_row_from_description(index=index, local_row=local_row)
+    if remote_row is not None:
+        return _link_context_response(
+            hostname=hostname,
+            interface_name=interface_name,
+            peer_ip=peer_ip,
+            local_row=local_row,
+            remote_row=remote_row,
+            topology_confidence="high",
+            resolution_method="description",
+        )
+
+    return _link_context_response(
+        hostname=hostname,
+        interface_name=local_row.get("interface_name") or interface_name,
+        peer_ip=peer_ip,
+        local_row=local_row,
+    )

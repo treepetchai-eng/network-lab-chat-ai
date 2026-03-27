@@ -6,11 +6,35 @@ export interface AIOpsMetricSnapshot {
   reopened_this_week: number;
 }
 
+export interface AIOpsIncidentMetadata {
+  intent_status?: "none" | "needs_confirmation" | "confirmed_intentional" | "confirmed_unintentional";
+  topology_confidence?: string;
+  link_id?: string;
+  root_host?: string;
+  root_interface?: string;
+  remote_host?: string;
+  remote_interface?: string;
+  cause_hint?: string;
+  intent_note?: string;
+  intent_actor?: string;
+  intent_confirmed_at?: string;
+  [key: string]: unknown;
+}
+
 export interface AIOpsIncident {
   id: number;
   incident_no: string;
   title: string;
   status: string;
+  workflow_phase: string;
+  incident_role?: "root" | "symptom";
+  root_incident_id?: number | null;
+  parent_incident_id?: number | null;
+  suppressed_in_list?: boolean;
+  relation_group_key?: string | null;
+  remediation_owner_incident_id?: number | null;
+  child_count?: number;
+  active_child_count?: number;
   severity: string;
   category: string;
   summary: string;
@@ -28,6 +52,7 @@ export interface AIOpsIncident {
   last_seen_at: string;
   resolved_at?: string | null;
   reopened_count: number;
+  metadata?: AIOpsIncidentMetadata | null;
 }
 
 export interface AIOpsTimelineEntry {
@@ -99,6 +124,8 @@ export interface AIOpsRawLog {
   received_at: string;
   parse_status: string;
   incident_no?: string | null;
+  incident_title?: string | null;
+  incident_hostname?: string | null;
 }
 
 export interface AIOpsEvent {
@@ -112,7 +139,16 @@ export interface AIOpsEvent {
   hostname?: string | null;
   raw_message?: string | null;
   incident_no?: string | null;
+  incident_title?: string | null;
+  incident_hostname?: string | null;
   created_at: string;
+}
+
+export interface AIOpsRelatedIncident {
+  incident: AIOpsIncident;
+  relation_reason: string;
+  relation_confidence?: string | null;
+  owns_remediation: boolean;
 }
 
 export interface AIOpsDevice {
@@ -136,6 +172,8 @@ export interface AIOpsDashboardPayload {
 
 export interface AIOpsIncidentDetailPayload {
   incident: AIOpsIncident;
+  related_incidents: AIOpsRelatedIncident[];
+  remediation_owner_incident?: AIOpsIncident | null;
   timeline: AIOpsTimelineEntry[];
   ai_summary?: AIOpsSummary | null;
   troubleshoot?: AIOpsTroubleshootRun | null;

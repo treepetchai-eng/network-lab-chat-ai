@@ -347,30 +347,44 @@ async def stream_chat(
                     elif tool_name == "lookup_device":
                         try:
                             parsed = json.loads(raw)
-                            found = "error" not in parsed
+                            found = isinstance(parsed, list) or "error" not in parsed
                         except Exception:
                             parsed = {}
                             found = False
 
                         # Update session device cache
-                        if found:
+                        if found and isinstance(parsed, dict):
                             session.device_cache[parsed["hostname"]] = {
                                 "ip_address": parsed.get("ip_address", ""),
                                 "os_platform": parsed.get("os_platform", ""),
                                 "device_role": parsed.get("device_role", ""),
                                 "site": parsed.get("site", ""),
                             }
+                        elif found and isinstance(parsed, list):
+                            for item in parsed:
+                                if not isinstance(item, dict) or "hostname" not in item:
+                                    continue
+                                session.device_cache[item["hostname"]] = {
+                                    "ip_address": item.get("ip_address", ""),
+                                    "os_platform": item.get("os_platform", ""),
+                                    "device_role": item.get("device_role", ""),
+                                    "site": item.get("site", ""),
+                                }
 
-                        resolved_via = parsed.get("resolved_via", "")
-                        step_name = (
-                            (
-                                f"Found {parsed.get('hostname', '?')} via interface IP"
-                                if found and resolved_via == "interface_ip"
-                                else f"Found {parsed.get('hostname', '?')}"
+                        if found and isinstance(parsed, list):
+                            role_name = str(parsed[0].get("device_role", "") or "role").strip()
+                            step_name = f"Matched role {role_name}"
+                        else:
+                            resolved_via = parsed.get("resolved_via", "")
+                            step_name = (
+                                (
+                                    f"Found {parsed.get('hostname', '?')} via interface IP"
+                                    if found and resolved_via == "interface_ip"
+                                    else f"Found {parsed.get('hostname', '?')}"
+                                )
+                                if found
+                                else "Device not found"
                             )
-                            if found
-                            else "Device not found"
-                        )
                         yield _sse(
                             "tool_result",
                             tool_name="lookup_device",
